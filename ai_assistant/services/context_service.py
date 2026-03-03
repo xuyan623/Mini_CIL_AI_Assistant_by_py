@@ -118,7 +118,8 @@ class ContextService:
                 f"```\n{item['code']}\n```"
             )
 
-        context_text = f"=== 代码上下文 ===\n{'\n\n'.join(blocks)}"
+        joined_blocks = "\n\n".join(blocks)
+        context_text = f"=== 代码上下文 ===\n{joined_blocks}"
         if max_chars is None or len(context_text) <= max_chars:
             return context_text
         return f"{context_text[:max_chars]}\n...(上下文已截断)"
