@@ -5,17 +5,19 @@ import re
 import sys
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ai_assistant.command_rules import build_cli_command_rules_prompt
 from ai_assistant.planner.plan_engine import PlanEngine
 from ai_assistant.planner.step_executor import StepExecutor
 from ai_assistant.planner.task_interpreter import TaskInterpreter
-from ai_assistant.planner.types import AIResponseEnvelope, PlanDecision, TaskSpec
+from ai_assistant.planner.types import AIResponseEnvelope, EntityRecord, PlanDecision, ReferenceResolutionResult, TaskSpec
 from ai_assistant.services.ai_client import AIClient
 from ai_assistant.services.ai_gateway import AIGateway
 from ai_assistant.services.context_service import ContextService
 from ai_assistant.services.history_service import HistoryService
+from ai_assistant.services.reference_resolver import ReferenceResolver
 
 
 @dataclass
@@ -36,6 +38,7 @@ class ShellService:
         self.history_service = history_service or HistoryService()
         self.context_service = context_service or ContextService()
         self.task_interpreter = TaskInterpreter()
+        self.reference_resolver = ReferenceResolver()
         self.max_steps = 10
         self.step_timeout_seconds = 30
         self.plan_engine = PlanEngine(step_timeout_seconds=self.step_timeout_seconds)
@@ -80,7 +83,10 @@ class ShellService:
         ok: bool,
         exit_code: int,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> str:
+        metadata_dict = dict(metadata or {})
+        event_id = str(metadata_dict.get("event_id") or uuid.uuid4().hex)
+        metadata_dict["event_id"] = event_id
         try:
             self.history_service.append_event(
                 event_type=event_type,
@@ -88,10 +94,11 @@ class ShellService:
                 output_text=output_text,
                 ok=ok,
                 exit_code=exit_code,
-                metadata=metadata,
+                metadata=metadata_dict,
             )
         except Exception:
-            return
+            return event_id
+        return event_id
 
     def _record_planner_trace(
         self,
@@ -140,52 +147,93 @@ class ShellService:
                 return parsed
         return None
 
-    @staticmethod
-    def _extract_commands(raw_response: str) -> list[str]:
-        cleaned = (raw_response or "").strip()
-        if not cleaned:
+    def _parse_planner_steps_json(self, raw_response: str) -> list[str]:
+        parsed = self._load_json_object(raw_response)
+        if not parsed:
             return []
-        commands: list[str] = []
-        for raw_line in cleaned.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line.startswith("```") or line.startswith("#"):
-                continue
-            if line.startswith("$ "):
-                line = line[2:].strip()
-            line = re.sub(r"^\d+\.\s+", "", line)
-            line = re.sub(r"^[-*]\s+", "", line)
-            if line:
-                commands.append(line)
-        return commands
-
-    @staticmethod
-    def _extract_first_command(raw_response: str) -> str:
-        commands = ShellService._extract_commands(raw_response)
-        if not commands:
-            return ""
-        return commands[0]
+        steps_raw = parsed.get("steps")
+        if not isinstance(steps_raw, list):
+            return []
+        steps: list[str] = []
+        for item in steps_raw:
+            if isinstance(item, str):
+                candidate = item.strip()
+            elif isinstance(item, dict):
+                candidate = str(item.get("command", "")).strip()
+            else:
+                candidate = ""
+            if candidate:
+                steps.append(candidate)
+        return steps
 
     def _parse_initial_steps(self, raw_response: str) -> list[str]:
-        parsed = self._load_json_object(raw_response)
-        if parsed:
-            if isinstance(parsed.get("steps"), list):
-                steps: list[str] = []
-                for item in parsed["steps"]:
-                    if isinstance(item, str):
-                        candidate = item.strip()
-                    elif isinstance(item, dict):
-                        candidate = str(item.get("command", "")).strip()
-                    else:
-                        candidate = ""
-                    if candidate:
-                        steps.append(candidate)
-                if steps:
-                    return steps
-            if parsed.get("action") is not None:
-                return []
-        return self._extract_commands(raw_response)
+        return self._parse_planner_steps_json(raw_response)
+
+    @staticmethod
+    def _is_natural_language_line(command: str) -> bool:
+        candidate = command.strip()
+        if not candidate:
+            return True
+        if len(candidate) > 180:
+            return True
+        rejected_prefixes = (
+            "首先",
+            "关键点",
+            "用户描述",
+            "回顾",
+            "可能的情况",
+            "目标是",
+            "作为助手",
+            "总结",
+            "说明",
+            "请注意",
+        )
+        if candidate.startswith(rejected_prefixes):
+            return True
+        chinese_chars = re.findall(r"[\u4e00-\u9fff]", candidate)
+        if len(chinese_chars) >= 6 and not re.search(r"[|;$><]", candidate):
+            if not re.search(r"\b(find|test|sed|head|wc|cp|mv|mkdir|ls|cat|ai)\b", candidate):
+                return True
+        return False
+
+    def _validate_shell_command(self, command: str) -> tuple[bool, str]:
+        candidate = (command or "").strip()
+        if not candidate:
+            return False, "❌ 生成的命令为空，已中止执行"
+        if self._is_natural_language_line(candidate):
+            return False, f"❌ 生成内容不是可执行命令：{candidate[:120]}"
+        return True, ""
+
+    def _repair_planner_output(
+        self,
+        *,
+        trace_id: str,
+        stage: str,
+        task_description: str,
+        raw_content: str,
+        expect: str,
+    ) -> AIResponseEnvelope:
+        if expect == "initial":
+            expected_schema = '{"summary":"...","steps":[{"command":"...","purpose":"..."}]}'
+        elif expect == "reference_vote":
+            expected_schema = '{"selected_entity_id":"<候选ID或空字符串>","confidence":0.0,"reason":"..."}'
+        else:
+            expected_schema = '{"action":"next|done|need_input|abort","command":"...","message":"...","confidence":0.0}'
+        prompt = (
+            "你刚才的输出不符合 JSON 协议。"
+            "请将下列原始输出修复为严格 JSON，且不要包含任何解释或 Markdown。\n"
+            f"目标 schema：{expected_schema}\n"
+            f"原始输出：\n{raw_content}"
+        )
+        return self._request_ai(
+            prompt=prompt,
+            trace_id=trace_id,
+            stage=f"{stage}_repair",
+            task_description=task_description,
+            max_tokens=512,
+            temperature=0.0,
+            timeout=45,
+        )
 
     def _confirm_with_prompt(self, prompt: str) -> tuple[bool, str]:
         while True:
@@ -231,6 +279,224 @@ class ShellService:
             "4. 只返回 JSON，不要解释，不要 Markdown。\n"
             f"用户描述：{description}"
         )
+
+    @staticmethod
+    def _candidate_to_dict(candidate: EntityRecord) -> dict[str, Any]:
+        return {
+            "entity_id": candidate.entity_id,
+            "entity_type": candidate.entity_type,
+            "value": candidate.value,
+            "normalized_value": candidate.normalized_value,
+            "created_at": candidate.created_at,
+            "confidence": candidate.confidence,
+            "metadata": candidate.metadata,
+        }
+
+    def _build_reference_vote_prompt(self, description: str, candidates: list[EntityRecord]) -> str:
+        candidate_payload = [self._candidate_to_dict(item) for item in candidates]
+        return (
+            "请从候选实体中选择“用户当前指代的文件”。\n"
+            "仅返回 JSON，不要解释。\n"
+            'JSON: {"selected_entity_id":"<候选ID或空字符串>","confidence":0.0,"reason":"<简短原因>"}\n'
+            "规则：\n"
+            "1. 只能从候选列表中选择；不确定请返回空字符串。\n"
+            "2. confidence 取值 0~1。\n"
+            f"用户描述：{description}\n"
+            f"候选列表：{json.dumps(candidate_payload, ensure_ascii=False)}"
+        )
+
+    def _vote_reference_with_ai(
+        self,
+        *,
+        description: str,
+        candidates: list[EntityRecord],
+        trace_id: str,
+    ) -> tuple[str, float, str]:
+        if not candidates:
+            return "", 0.0, "无候选可投票"
+        prompt = self._build_reference_vote_prompt(description, candidates)
+        response = self._request_ai(
+            prompt=prompt,
+            trace_id=trace_id,
+            stage="reference_vote",
+            task_description=description,
+            max_tokens=300,
+            temperature=0.0,
+            timeout=45,
+        )
+        if not response.ok:
+            return "", 0.0, response.content
+        parsed = self._load_json_object(response.content)
+        if not parsed:
+            repaired = self._repair_planner_output(
+                trace_id=trace_id,
+                stage="reference_vote",
+                task_description=description,
+                raw_content=response.content,
+                expect="reference_vote",
+            )
+            if not repaired.ok:
+                return "", 0.0, repaired.content
+            parsed = self._load_json_object(repaired.content) or {}
+        selected_entity_id = str(parsed.get("selected_entity_id", "")).strip()
+        reason = str(parsed.get("reason", "")).strip()
+        try:
+            confidence = float(parsed.get("confidence", 0.0) or 0.0)
+        except Exception:
+            confidence = 0.0
+        if confidence < 0:
+            confidence = 0.0
+        if confidence > 1:
+            confidence = 1.0
+        return selected_entity_id, confidence, reason
+
+    @staticmethod
+    def _normalize_file_value(raw_value: str) -> str:
+        cleaned = str(raw_value).strip().strip("\"' ")
+        if not cleaned:
+            return ""
+        if re.match(r"^[A-Za-z]:\\", cleaned):
+            return cleaned
+        candidate = Path(cleaned).expanduser()
+        if not candidate.is_absolute():
+            candidate = (Path.cwd() / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        return str(candidate)
+
+    def _resolve_references(self, task: TaskSpec, trace_id: str) -> tuple[bool, TaskSpec, str]:
+        if task.parameters.get("file"):
+            return True, task, ""
+
+        entities = self.history_service.list_entities()
+        local_result = self.reference_resolver.resolve_file_reference(
+            description=task.normalized_description,
+            entities=entities,
+        )
+        local_status = local_result.status
+        local_reason = local_result.reason
+
+        selected_entity: EntityRecord | None = local_result.selected_entity
+        if local_status == "ambiguous":
+            candidate_lines = [f"  - {item.normalized_value or item.value}" for item in local_result.candidates[:8]]
+            message = "❌ 检测到“这个文件/它”存在多个候选，请先明确目标路径：\n" + "\n".join(candidate_lines)
+            self.history_service.append_resolution_trace(
+                trace_id=trace_id,
+                request=task.normalized_description,
+                response=message,
+                ok=False,
+                metadata={"source": "local", "status": "ambiguous", "candidate_count": len(local_result.candidates)},
+            )
+            return False, task, message
+
+        ai_selected_id = ""
+        ai_confidence = 0.0
+        ai_reason = ""
+        if local_result.candidates:
+            ai_selected_id, ai_confidence, ai_reason = self._vote_reference_with_ai(
+                description=task.normalized_description,
+                candidates=local_result.candidates,
+                trace_id=trace_id,
+            )
+
+        if local_status == "resolved":
+            if ai_selected_id:
+                if not selected_entity or ai_selected_id != selected_entity.entity_id:
+                    message = "❌ 指代解析冲突：本地与模型选择不一致，请明确文件路径"
+                    self.history_service.append_resolution_trace(
+                        trace_id=trace_id,
+                        request=task.normalized_description,
+                        response=message,
+                        ok=False,
+                        metadata={
+                            "source": "vote",
+                            "status": "ambiguous",
+                            "local_entity": selected_entity.entity_id if selected_entity else "",
+                            "model_entity": ai_selected_id,
+                            "model_confidence": ai_confidence,
+                            "model_reason": ai_reason,
+                        },
+                    )
+                    return False, task, message
+            if selected_entity:
+                resolved_path = self._normalize_file_value(selected_entity.normalized_value or selected_entity.value)
+                if resolved_path:
+                    task.parameters["file"] = resolved_path
+                    lowered = task.normalized_description.lower()
+                    if task.capability_id is None and any(token in lowered for token in ("备份", "backup")):
+                        task.capability_id = "backup.create"
+                    if resolved_path not in task.normalized_description:
+                        task.normalized_description = f"{task.normalized_description}（目标文件：{resolved_path}）"
+                    note = f"已解析“这个文件”为：{resolved_path}"
+                    task.note = note if not task.note else f"{task.note}；{note}"
+            self.history_service.append_resolution_trace(
+                trace_id=trace_id,
+                request=task.normalized_description,
+                response=task.parameters.get("file", ""),
+                ok=True,
+                metadata={
+                    "source": "local",
+                    "status": "resolved",
+                    "reason": local_reason,
+                    "entity_id": selected_entity.entity_id if selected_entity else "",
+                    "model_entity": ai_selected_id,
+                    "model_confidence": ai_confidence,
+                    "model_reason": ai_reason,
+                },
+            )
+            return True, task, ""
+
+        if local_status == "missing":
+            selected_from_ai: EntityRecord | None = None
+            if ai_selected_id and ai_confidence >= 0.85:
+                for candidate in local_result.candidates:
+                    if candidate.entity_id == ai_selected_id and candidate.metadata.get("rejected_reason") != "platform_mismatch":
+                        selected_from_ai = candidate
+                        break
+            if selected_from_ai:
+                resolved_path = self._normalize_file_value(selected_from_ai.normalized_value or selected_from_ai.value)
+                if resolved_path:
+                    task.parameters["file"] = resolved_path
+                    lowered = task.normalized_description.lower()
+                    if task.capability_id is None and any(token in lowered for token in ("备份", "backup")):
+                        task.capability_id = "backup.create"
+                    if resolved_path not in task.normalized_description:
+                        task.normalized_description = f"{task.normalized_description}（目标文件：{resolved_path}）"
+                    note = f"已根据历史解析“这个文件”为：{resolved_path}"
+                    task.note = note if not task.note else f"{task.note}；{note}"
+                    self.history_service.append_resolution_trace(
+                        trace_id=trace_id,
+                        request=task.normalized_description,
+                        response=resolved_path,
+                        ok=True,
+                        metadata={
+                            "source": "model",
+                            "status": "resolved",
+                            "model_entity": ai_selected_id,
+                            "model_confidence": ai_confidence,
+                            "model_reason": ai_reason,
+                        },
+                    )
+                    return True, task, ""
+
+            message = "❌ 无法解析“这个文件”，请补充明确路径（例如：./mycode/Sam.c）"
+            self.history_service.append_resolution_trace(
+                trace_id=trace_id,
+                request=task.normalized_description,
+                response=message,
+                ok=False,
+                metadata={
+                    "source": "local",
+                    "status": "missing",
+                    "reason": local_reason,
+                    "model_entity": ai_selected_id,
+                    "model_confidence": ai_confidence,
+                    "model_reason": ai_reason,
+                },
+            )
+            return False, task, message
+
+        return True, task, ""
 
     def _build_replan_prompt(
         self,
@@ -342,6 +608,11 @@ class ShellService:
         if base_task.capability_id == "__invalid__" or base_task.note.startswith("❌"):
             return False, base_task, [], base_task.note
 
+        resolved_ok, resolved_task, resolved_message = self._resolve_references(base_task, trace_id)
+        if not resolved_ok:
+            return False, resolved_task, [], resolved_message
+        base_task = resolved_task
+
         parsed_task = self._interpret_task_with_ai(base_task, trace_id)
         task = parsed_task or base_task
         if task.note.startswith("❌"):
@@ -373,9 +644,22 @@ class ShellService:
 
         commands = self._parse_initial_steps(response.content)
         if not commands:
-            return False, task, [], "❌ 未生成有效命令"
+            repaired = self._repair_planner_output(
+                trace_id=trace_id,
+                stage="initial",
+                task_description=task.normalized_description,
+                raw_content=response.content,
+                expect="initial",
+            )
+            if repaired.ok:
+                commands = self._parse_initial_steps(repaired.content)
+        if not commands:
+            return False, task, [], "❌ 规划输出不合规：未返回 JSON steps"
 
         for command in commands:
+            executable, executable_message = self._validate_shell_command(command)
+            if not executable:
+                return False, task, [], executable_message
             valid, validation_message = self.plan_engine.validate_ai_code_command(command)
             if not valid:
                 return False, task, [], validation_message
@@ -422,17 +706,132 @@ class ShellService:
             return False, PlanDecision(action="abort", message=response.content)
 
         parsed = self._load_json_object(response.content)
+        if not parsed:
+            repaired = self._repair_planner_output(
+                trace_id=trace_id,
+                stage="replan",
+                task_description=description,
+                raw_content=response.content,
+                expect="decision",
+            )
+            if repaired.ok:
+                parsed = self._load_json_object(repaired.content)
+            else:
+                return False, PlanDecision(action="abort", message=repaired.content)
         if parsed:
             action = str(parsed.get("action", "")).strip().lower()
             command = str(parsed.get("command", "")).strip()
             message = str(parsed.get("message", "")).strip()
             if action in {"next", "done", "need_input", "abort"}:
+                if action == "next":
+                    executable, executable_message = self._validate_shell_command(command)
+                    if not executable:
+                        return False, PlanDecision(action="abort", message=executable_message)
                 return True, PlanDecision(action=action, command=command, message=message)
 
-        fallback_command = self._extract_first_command(response.content)
-        if fallback_command:
-            return True, PlanDecision(action="next", command=fallback_command, message="")
-        return False, PlanDecision(action="abort", message="未能解析下一步决策")
+        return False, PlanDecision(action="abort", message="未能解析下一步决策 JSON")
+
+    @staticmethod
+    def _extract_paths_from_text(text: str) -> list[str]:
+        candidates: set[str] = set()
+        for raw_line in (text or "").splitlines():
+            line = raw_line.strip().strip("\"'")
+            if not line:
+                continue
+            if line.startswith("- "):
+                line = line[2:].strip()
+            if line.startswith("└─ "):
+                line = line[3:].strip()
+            if line.startswith(".") or line.startswith("/") or re.match(r"^[A-Za-z]:\\", line):
+                if "/" in line or "\\" in line:
+                    candidates.add(line)
+        return sorted(candidates)
+
+    def _append_file_entity(
+        self,
+        *,
+        value: str,
+        source_event_id: str,
+        trace_id: str,
+        confidence: float,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        normalized = self._normalize_file_value(value)
+        if not normalized:
+            return
+        platform = "windows" if re.match(r"^[A-Za-z]:\\", normalized) else "alpine"
+        self.history_service.append_entity(
+            entity_type="file",
+            value=value,
+            normalized_value=normalized,
+            source_event_id=source_event_id,
+            trace_id=trace_id,
+            confidence=confidence,
+            platform=platform,
+            metadata=metadata or {},
+        )
+
+    def _extract_entities_from_step_output(
+        self,
+        *,
+        command: str,
+        stdout: str,
+        stderr: str,
+        source_event_id: str,
+        trace_id: str,
+    ) -> None:
+        file_path_match = re.search(r"\btest\s+-f\s+(.+)$", command)
+        if file_path_match:
+            raw_file = file_path_match.group(1).strip().strip("\"'")
+            self._append_file_entity(
+                value=raw_file,
+                source_event_id=source_event_id,
+                trace_id=trace_id,
+                confidence=0.95,
+                metadata={"source": "test -f"},
+            )
+
+        backup_match = re.search(r"\bai\s+backup\s+create\s+([^\s]+)", command)
+        if backup_match:
+            raw_file = backup_match.group(1).strip().strip("\"'")
+            self._append_file_entity(
+                value=raw_file,
+                source_event_id=source_event_id,
+                trace_id=trace_id,
+                confidence=0.95,
+                metadata={"source": "ai backup create"},
+            )
+
+        code_match = re.search(r"\bai\s+code\s+\w+\s+([^\s]+)", command)
+        if code_match:
+            raw_file = code_match.group(1).strip().strip("\"'")
+            self._append_file_entity(
+                value=raw_file,
+                source_event_id=source_event_id,
+                trace_id=trace_id,
+                confidence=0.9,
+                metadata={"source": "ai code"},
+            )
+
+        if "find " in command:
+            for path in self._extract_paths_from_text(stdout):
+                self._append_file_entity(
+                    value=path,
+                    source_event_id=source_event_id,
+                    trace_id=trace_id,
+                    confidence=0.9,
+                    metadata={"source": "find"},
+                )
+
+        if "ai file find " in command:
+            for path in self._extract_paths_from_text(stdout):
+                self._append_file_entity(
+                    value=path,
+                    source_event_id=source_event_id,
+                    trace_id=trace_id,
+                    confidence=0.85,
+                    metadata={"source": "ai file find"},
+                )
 
     def run(self, description: str) -> tuple[bool, str]:
         trace_id = uuid.uuid4().hex
@@ -502,6 +901,10 @@ class ShellService:
                 if not resolved_ok:
                     return False, f"❌ {resolved_error}"
 
+                executable, executable_message = self._validate_shell_command(resolved_command)
+                if not executable:
+                    return False, executable_message
+
                 valid, validation_message = self.plan_engine.validate_ai_code_command(resolved_command)
                 if not valid:
                     return False, validation_message
@@ -555,7 +958,7 @@ class ShellService:
                     f"stdout:\n{step_result.stdout}\n"
                     f"stderr:\n{step_result.stderr}"
                 )
-                self._record_event(
+                step_event_id = self._record_event(
                     event_type="shell_step",
                     input_text=resolved_command,
                     output_text=event_output,
@@ -569,6 +972,13 @@ class ShellService:
                         "stdout": step_result.stdout,
                         "stderr": step_result.stderr,
                     },
+                )
+                self._extract_entities_from_step_output(
+                    command=resolved_command,
+                    stdout=step_result.stdout,
+                    stderr=step_result.stderr,
+                    source_event_id=step_event_id,
+                    trace_id=trace_id,
                 )
                 transcript.append(
                     {

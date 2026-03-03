@@ -22,6 +22,7 @@ from ai_assistant.services.code_service import CodeService
 from ai_assistant.services.config_service import ConfigService
 from ai_assistant.services.context_service import ContextService
 from ai_assistant.services.history_service import HistoryService
+from ai_assistant.services.reference_resolver import ReferenceResolver
 from ai_assistant.services.shell_service import ShellService
 
 
@@ -136,7 +137,7 @@ class HistoryServiceTests(EnvMixin, unittest.TestCase):
         self.assertIn("messages", payload)
         self.assertGreater(len(payload["messages"]), 1)
 
-    def test_history_v2_payload_is_auto_migrated_to_v4(self) -> None:
+    def test_history_v2_payload_is_auto_migrated_to_v5(self) -> None:
         manager = PathManager(project_root=self.project_root)
         history_path = manager.history_path
         legacy_payload = {
@@ -158,9 +159,10 @@ class HistoryServiceTests(EnvMixin, unittest.TestCase):
 
         service = HistoryService(manager)
         migrated_payload = service.load_payload()
-        self.assertEqual(migrated_payload.get("version"), 4)
+        self.assertEqual(migrated_payload.get("version"), 5)
         self.assertTrue(migrated_payload.get("events"))
         self.assertIn("planner_traces", migrated_payload)
+        self.assertIn("entities", migrated_payload)
         first_event = migrated_payload["events"][0]
         self.assertIn("event_id", first_event)
         self.assertIn("trace_id", first_event)
@@ -206,6 +208,95 @@ class ConfigServiceTests(EnvMixin, unittest.TestCase):
         self.assertIn("仅支持 v2 导出配置格式", message)
 
 
+class ReferenceResolverTests(EnvMixin, unittest.TestCase):
+    def test_resolve_pronoun_with_unique_recent_file_entity(self) -> None:
+        target = self.base / "Sam.c"
+        target.write_text("int main(){return 0;}\n", encoding="utf-8")
+        resolver = ReferenceResolver()
+        result = resolver.resolve_file_reference(
+            description="帮我备份这个文件",
+            entities=[
+                {
+                    "entity_id": "e1",
+                    "entity_type": "file",
+                    "value": str(target),
+                    "normalized_value": str(target.resolve()),
+                    "source_event_id": "ev1",
+                    "trace_id": "tr1",
+                    "created_at": "2026-03-03T00:00:00+00:00",
+                    "confidence": 0.95,
+                    "platform": "alpine",
+                    "metadata": {},
+                }
+            ],
+        )
+        self.assertEqual(result.status, "resolved")
+        self.assertIsNotNone(result.selected_entity)
+        self.assertIn("Sam.c", result.selected_entity.normalized_value if result.selected_entity else "")
+
+    def test_resolve_pronoun_ambiguous_when_multiple_candidates(self) -> None:
+        first = self.base / "a" / "Sam.c"
+        second = self.base / "b" / "Sam.c"
+        first.parent.mkdir(parents=True, exist_ok=True)
+        second.parent.mkdir(parents=True, exist_ok=True)
+        first.write_text("1\n", encoding="utf-8")
+        second.write_text("2\n", encoding="utf-8")
+        resolver = ReferenceResolver()
+        result = resolver.resolve_file_reference(
+            description="给这个文件加注释",
+            entities=[
+                {
+                    "entity_id": "e1",
+                    "entity_type": "file",
+                    "value": str(first),
+                    "normalized_value": str(first.resolve()),
+                    "source_event_id": "ev1",
+                    "trace_id": "tr1",
+                    "created_at": "2026-03-03T00:00:00+00:00",
+                    "confidence": 0.95,
+                    "platform": "alpine",
+                    "metadata": {},
+                },
+                {
+                    "entity_id": "e2",
+                    "entity_type": "file",
+                    "value": str(second),
+                    "normalized_value": str(second.resolve()),
+                    "source_event_id": "ev2",
+                    "trace_id": "tr2",
+                    "created_at": "2026-03-03T00:01:00+00:00",
+                    "confidence": 0.95,
+                    "platform": "alpine",
+                    "metadata": {},
+                },
+            ],
+        )
+        self.assertEqual(result.status, "ambiguous")
+        self.assertGreaterEqual(len(result.candidates), 2)
+
+    def test_resolve_pronoun_windows_path_only_returns_missing_in_alpine_mode(self) -> None:
+        resolver = ReferenceResolver()
+        with mock.patch("ai_assistant.services.reference_resolver.os.name", "posix"):
+            result = resolver.resolve_file_reference(
+                description="备份这个文件",
+                entities=[
+                    {
+                        "entity_id": "e1",
+                        "entity_type": "file",
+                        "value": "C:\\Users\\xuyan\\Sam.c",
+                        "normalized_value": "C:\\Users\\xuyan\\Sam.c",
+                        "source_event_id": "ev1",
+                        "trace_id": "tr1",
+                        "created_at": "2026-03-03T00:00:00+00:00",
+                        "confidence": 0.95,
+                        "platform": "windows",
+                        "metadata": {},
+                    }
+                ],
+            )
+        self.assertEqual(result.status, "missing")
+
+
 class ShellServiceTests(EnvMixin, unittest.TestCase):
     def test_safety_regex_detects_pipe_exec(self) -> None:
         service = ShellService(ai_client=None)
@@ -223,6 +314,53 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         ok, message = service.generate_command("列出当前目录文件")
         self.assertFalse(ok)
         self.assertIn("未生成有效命令", message)
+
+    def test_generate_command_repairs_non_json_initial_plan(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                "首先，用户描述是：打印 hello",
+                '{"summary":"打印","steps":[{"command":"echo hello","purpose":"打印"}]}',
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, command_text = service.generate_command("打印 hello")
+        self.assertTrue(ok)
+        self.assertIn("echo hello", command_text)
+
+    def test_generate_command_aborts_when_non_json_cannot_repair(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                "首先，用户描述是：打印 hello",
+                (False, "❌ API 返回空内容"),
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, message = service.generate_command("打印 hello")
+        self.assertFalse(ok)
+        self.assertIn("规划输出不合规", message)
+
+    def test_generate_command_rejects_thought_text_as_command(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"summary":"测试","steps":[{"command":"首先，用户描述是：请执行命令","purpose":"错误示例"}]}'
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, message = service.generate_command("打印 hello")
+        self.assertFalse(ok)
+        self.assertIn("不是可执行命令", message)
 
     def test_generate_command_requires_filename_for_comment_intent(self) -> None:
         fake_client = FakeAIClient(
@@ -256,7 +394,7 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         self.assertIn("ai code comment <FILE_PATH> --start 1 --end <END_LINE> --yes", command_text)
 
     def test_generate_command_rejects_incomplete_ai_code_command(self) -> None:
-        fake_client = FakeAIClient(response="ai code check test123.c")
+        fake_client = FakeAIClient(response='{"summary":"检查","steps":[{"command":"ai code check test123.c","purpose":"检查"}]}')
         manager = PathManager(project_root=self.project_root)
         history = HistoryService(manager)
         context = ContextService(manager)
@@ -384,7 +522,7 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         self.assertGreaterEqual(len(fake_client.calls), 1)
 
     def test_run_non_interactive_keeps_generate_only_behavior(self) -> None:
-        fake_client = FakeAIClient(response="echo hello")
+        fake_client = FakeAIClient(response='{"summary":"打印","steps":[{"command":"echo hello","purpose":"打印"}]}')
         manager = PathManager(project_root=self.project_root)
         history = HistoryService(manager)
         context = ContextService(manager)
@@ -396,7 +534,7 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         self.assertIn("非交互模式", message)
 
     def test_run_interactive_can_cancel_execution(self) -> None:
-        fake_client = FakeAIClient(response="echo hello")
+        fake_client = FakeAIClient(response='{"summary":"打印","steps":[{"command":"echo hello","purpose":"打印"}]}')
         manager = PathManager(project_root=self.project_root)
         history = HistoryService(manager)
         context = ContextService(manager)
@@ -513,7 +651,7 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         manager = PathManager(project_root=self.project_root)
         history = HistoryService(manager)
         context = ContextService(manager)
-        fake_client = FakeAIClient(response="ls -la")
+        fake_client = FakeAIClient(response='{"summary":"重试","steps":[{"command":"echo retry","purpose":"重试"}]}')
         service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
 
         target = self.base / "Sam.c"
@@ -587,6 +725,99 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("完成", message)
 
+    def test_find_then_backup_this_file_uses_resolved_entity_path(self) -> None:
+        target = self.base / "mycode" / "Sam.c"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("int main(){return 0;}\n", encoding="utf-8")
+
+        fake_client = FakeAIClient(
+            responses=[
+                "not-json",
+                '{"summary":"查找","steps":[{"command":"find . -type f -name Sam.c","purpose":"定位"}]}',
+                '{"action":"done","message":"找到"}',
+                json.dumps(
+                    {
+                        "capability_id": "backup.create",
+                        "parameters": {"file": str(target)},
+                        "missing_parameters": [],
+                        "note": "",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        with mock.patch("sys.stdin.isatty", return_value=True):
+            with mock.patch.object(ShellService, "_confirm_with_prompt", side_effect=[(True, "y"), (True, "y")]):
+                with mock.patch(
+                    "subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        args="find . -type f -name Sam.c",
+                        returncode=0,
+                        stdout=f"{target}\n",
+                        stderr="",
+                    ),
+                ):
+                    ok_first, message_first = service.run("帮我找到Sam.c文件的位置")
+        self.assertTrue(ok_first)
+        self.assertIn("找到", message_first)
+
+        ok_second, command_text = service.generate_command("帮我备份这个文件")
+        self.assertTrue(ok_second)
+        self.assertIn("ai backup create", command_text)
+        self.assertIn(str(target.resolve()), command_text)
+
+    def test_retry_keeps_file_resolution_from_entities(self) -> None:
+        target = self.base / "mycode" / "Sam.c"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("int main(){return 0;}\n", encoding="utf-8")
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+
+        history.append_entity(
+            entity_type="file",
+            value=str(target),
+            normalized_value=str(target.resolve()),
+            source_event_id="ev-find",
+            trace_id="trace-find",
+            confidence=0.95,
+            platform="alpine",
+            metadata={"source": "find"},
+        )
+        history.append_event(
+            event_type="shell_plan",
+            input_text="帮我备份这个文件",
+            output_text="ai backup create /tmp/demo --keep 5",
+            ok=True,
+            exit_code=0,
+        )
+
+        fake_client = FakeAIClient(
+            responses=[
+                json.dumps(
+                    {
+                        "capability_id": "backup.create",
+                        "parameters": {"file": str(target.resolve())},
+                        "missing_parameters": [],
+                        "note": "",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        with mock.patch("sys.stdin.isatty", return_value=False):
+            ok, message = service.run("重试")
+        self.assertTrue(ok)
+        self.assertIn("ai backup create", message)
+        self.assertIn(str(target.resolve()), message)
+
 
 class AIPromptCompositionTests(EnvMixin, unittest.TestCase):
     def setUp(self) -> None:
@@ -655,7 +886,9 @@ class AIPromptCompositionTests(EnvMixin, unittest.TestCase):
         self.assertIn("AI 未返回有效检查结果", output)
 
     def test_shell_service_uses_history_events_and_context(self) -> None:
-        fake_client = FakeAIClient(response="ls -la")
+        fake_client = FakeAIClient(
+            response='{"summary":"列目录","steps":[{"command":"ls -la","purpose":"查看当前目录"}]}'
+        )
         service = ShellService(ai_client=fake_client, history_service=self.history, context_service=self.context)
 
         ok, command = service.generate_command("查看当前目录")

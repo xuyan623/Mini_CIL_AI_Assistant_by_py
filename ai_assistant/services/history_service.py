@@ -26,6 +26,7 @@ class HistorySettings:
     event_output_preview_chars: int = 240
     max_events: int | None = None
     max_planner_traces: int | None = None
+    max_entities: int = 2000
 
 
 class HistoryService:
@@ -36,10 +37,11 @@ class HistoryService:
 
     def _default_payload(self) -> dict[str, Any]:
         return {
-            "version": 4,
+            "version": 5,
             "messages": [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
             "events": [],
             "planner_traces": [],
+            "entities": [],
         }
 
     @staticmethod
@@ -97,6 +99,26 @@ class HistoryService:
             "metadata": metadata,
         }
 
+    @staticmethod
+    def _normalize_entity(raw_entity: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_entity, dict):
+            return None
+        metadata = raw_entity.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return {
+            "entity_id": str(raw_entity.get("entity_id") or uuid.uuid4().hex),
+            "entity_type": str(raw_entity.get("entity_type", "unknown")),
+            "value": str(raw_entity.get("value", "")),
+            "normalized_value": str(raw_entity.get("normalized_value", raw_entity.get("value", ""))),
+            "source_event_id": str(raw_entity.get("source_event_id", "")),
+            "trace_id": str(raw_entity.get("trace_id", "")),
+            "created_at": str(raw_entity.get("created_at", datetime.now(timezone.utc).isoformat())),
+            "confidence": float(raw_entity.get("confidence", 1.0) or 1.0),
+            "platform": str(raw_entity.get("platform", "alpine")),
+            "metadata": metadata,
+        }
+
     def load_payload(self) -> dict[str, Any]:
         with file_lock(self.lock_path):
             payload = safe_load_json(self.path_manager.history_path, self._default_payload())
@@ -105,16 +127,19 @@ class HistoryService:
             if not isinstance(payload, dict):
                 payload = self._default_payload()
             payload_version = int(payload.get("version", 1) or 1)
-            payload["version"] = 4
+            payload["version"] = 5
             payload.setdefault("messages", [])
             payload.setdefault("events", [])
             payload.setdefault("planner_traces", [])
+            payload.setdefault("entities", [])
             if not isinstance(payload["messages"], list):
                 payload["messages"] = []
             if not isinstance(payload["events"], list):
                 payload["events"] = []
             if not isinstance(payload["planner_traces"], list):
                 payload["planner_traces"] = []
+            if not isinstance(payload["entities"], list):
+                payload["entities"] = []
             if not payload["messages"]:
                 payload["messages"] = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
 
@@ -132,8 +157,15 @@ class HistoryService:
                     normalized_traces.append(normalized_trace)
             payload["planner_traces"] = normalized_traces
 
-            if payload_version < 4:
-                payload["version"] = 4
+            normalized_entities: list[dict[str, Any]] = []
+            for raw_entity in payload["entities"]:
+                normalized_entity = self._normalize_entity(raw_entity)
+                if normalized_entity is not None:
+                    normalized_entities.append(normalized_entity)
+            payload["entities"] = normalized_entities
+
+            if payload_version < 5:
+                payload["version"] = 5
             atomic_write_json(self.path_manager.history_path, payload)
             return payload
 
@@ -155,6 +187,13 @@ class HistoryService:
     def list_planner_traces(self) -> list[dict[str, Any]]:
         payload = self.load_payload()
         return payload.get("planner_traces", [])
+
+    def list_entities(self) -> list[dict[str, Any]]:
+        payload = self.load_payload()
+        entities = payload.get("entities", [])
+        if not isinstance(entities, list):
+            return []
+        return entities
 
     def append_message(self, role: str, content: str) -> None:
         payload = self.load_payload()
@@ -240,6 +279,99 @@ class HistoryService:
         if self.settings.max_planner_traces is not None and len(traces) > self.settings.max_planner_traces:
             payload["planner_traces"] = traces[-self.settings.max_planner_traces :]
         self.save_payload(payload)
+
+    def append_resolution_trace(
+        self,
+        *,
+        trace_id: str,
+        request: str,
+        response: str,
+        ok: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        self.append_planner_trace(
+            trace_id=trace_id,
+            stage="reference_resolution",
+            request=request,
+            response=response,
+            ok=ok,
+            error_code="" if ok else "resolution_failed",
+            used_profile="",
+            attempts=[],
+            metadata=metadata_dict,
+        )
+        self.append_event(
+            event_type="resolution",
+            input_text=request,
+            output_text=response,
+            ok=ok,
+            exit_code=0 if ok else 1,
+            metadata={
+                "module": "shell",
+                "phase": "plan",
+                "trace_id": trace_id,
+                "source": metadata_dict.get("source", ""),
+                "status": metadata_dict.get("status", ""),
+                "candidate_count": metadata_dict.get("candidate_count", 0),
+                "decision_source": metadata_dict.get("source", ""),
+                **metadata_dict,
+            },
+        )
+
+    def append_entity(
+        self,
+        *,
+        entity_type: str,
+        value: str,
+        normalized_value: str | None = None,
+        source_event_id: str = "",
+        trace_id: str = "",
+        confidence: float = 1.0,
+        platform: str = "alpine",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = self.load_payload()
+        entity = {
+            "entity_id": uuid.uuid4().hex,
+            "entity_type": str(entity_type),
+            "value": str(value),
+            "normalized_value": str(normalized_value if normalized_value is not None else value),
+            "source_event_id": str(source_event_id),
+            "trace_id": str(trace_id),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "confidence": float(confidence),
+            "platform": str(platform),
+            "metadata": metadata if isinstance(metadata, dict) else {},
+        }
+        entities = payload.setdefault("entities", [])
+        entities.append(entity)
+        if len(entities) > self.settings.max_entities:
+            payload["entities"] = entities[-self.settings.max_entities :]
+        self.save_payload(payload)
+        return entity
+
+    def find_entities(
+        self,
+        *,
+        entity_type: str | None = None,
+        keyword: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        entities = self.list_entities()
+        filtered = entities
+        if entity_type:
+            filtered = [item for item in filtered if str(item.get("entity_type", "")) == entity_type]
+        if keyword:
+            lowered = keyword.lower()
+            filtered = [
+                item
+                for item in filtered
+                if lowered in str(item.get("value", "")).lower()
+                or lowered in str(item.get("normalized_value", "")).lower()
+            ]
+        filtered = sorted(filtered, key=lambda item: str(item.get("created_at", "")), reverse=True)
+        return filtered[:limit]
 
     def append_command_record(
         self,

@@ -67,3 +67,41 @@ class AIResponseEnvelope:
     raw: dict[str, Any] | None = None
     attempts: list[dict[str, Any]] = field(default_factory=list)
     used_profile: str = ""
+
+
+@dataclass
+class EntityRecord:
+    entity_id: str
+    entity_type: str
+    value: str
+    normalized_value: str
+    source_event_id: str
+    trace_id: str
+    created_at: str
+    confidence: float = 1.0
+    platform: str = "alpine"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ReferenceResolutionResult:
+    status: str
+    selected_entity: EntityRecord | None = None
+    candidates: list[EntityRecord] = field(default_factory=list)
+    reason: str = ""
+
+
+@dataclass
+class PlannerEnvelope:
+    summary: str
+    steps: list[PlanStep] = field(default_factory=list)
+    safety_notes: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+
+
+@dataclass
+class NextDecisionEnvelope:
+    action: str
+    command: str = ""
+    message: str = ""
+    confidence: float = 0.0

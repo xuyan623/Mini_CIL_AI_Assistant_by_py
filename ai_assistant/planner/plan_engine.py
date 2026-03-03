@@ -162,6 +162,16 @@ class PlanEngine:
                 return True, self._build_code_steps(resolved_path, "fix"), task.note
             return True, self._build_file_resolution_steps(Path(target_file).name, "fix"), note
 
+        if capability_id == "backup.create":
+            target_file = task.parameters.get("file", "")
+            if not target_file:
+                return False, [], "❌ 描述缺少目标文件名，请补充例如：test123.c"
+            resolved_path, note = self._resolve_single_file(target_file)
+            if resolved_path:
+                quoted = shlex.quote(resolved_path)
+                return True, [PlanStep(command=f"ai backup create {quoted} --keep 5", purpose="创建备份")], task.note
+            return True, [PlanStep(command=f"find . -type f -name {shlex.quote(Path(target_file).name)}", purpose="定位目标文件"), PlanStep(command="ai backup create <FILE_PATH> --keep 5", purpose="创建备份")], note
+
         if capability_id.startswith("code."):
             mode = capability_id.split(".", 1)[1]
             target_file = task.parameters.get("file", "")
