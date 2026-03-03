@@ -10,9 +10,9 @@ from pathlib import Path
 from unittest import mock
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-AI_ENTRY = REPO_ROOT / "root" / "ai.py"
-ROOT_DIR = REPO_ROOT / "root"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+AI_ENTRY = REPO_ROOT / "ai.py"
+ROOT_DIR = REPO_ROOT
 
 
 class CLITests(unittest.TestCase):
