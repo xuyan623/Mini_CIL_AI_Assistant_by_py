@@ -1,0 +1,23 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 备份文件（测试用）
+.backups/
+*.bak
+
+# 本地导出配置（可能包含敏感信息）
+*.profile.json
+*.secret.json
+
+# 运行时目录（含敏感配置与历史）
+assistant-config/
+assistant-state/
+assistant-data/
+
+# 常见本地敏感/日志文件
+.env
+.env.*
+*.log
