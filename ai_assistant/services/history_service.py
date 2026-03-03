@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import re
+import uuid
 from typing import Any
 
 from ai_assistant.storage import atomic_write_json, file_lock, safe_load_json
@@ -20,8 +22,10 @@ class HistorySettings:
     keep_recent_rounds: int = 3
     recent_history_limit: int = 12
     recent_event_limit: int = 20
+    related_event_limit: int = 6
     event_output_preview_chars: int = 240
-    max_events: int = 1000
+    max_events: int | None = None
+    max_planner_traces: int | None = None
 
 
 class HistoryService:
@@ -32,9 +36,65 @@ class HistoryService:
 
     def _default_payload(self) -> dict[str, Any]:
         return {
-            "version": 2,
+            "version": 4,
             "messages": [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
             "events": [],
+            "planner_traces": [],
+        }
+
+    @staticmethod
+    def _normalize_event(raw_event: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_event, dict):
+            return None
+
+        metadata = raw_event.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        event_id = str(raw_event.get("event_id") or uuid.uuid4().hex)
+        trace_id = str(raw_event.get("trace_id") or metadata.get("trace_id") or event_id)
+        module = str(raw_event.get("module") or metadata.get("module") or "")
+        phase = str(raw_event.get("phase") or metadata.get("phase") or metadata.get("stage") or "")
+        parent_event_id = str(raw_event.get("parent_event_id") or metadata.get("parent_event_id") or "")
+
+        normalized: dict[str, Any] = {
+            "event_id": event_id,
+            "trace_id": trace_id,
+            "timestamp": raw_event.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            "event_type": str(raw_event.get("event_type", "unknown")),
+            "module": module,
+            "phase": phase,
+            "parent_event_id": parent_event_id,
+            "input": str(raw_event.get("input", "")),
+            "output": str(raw_event.get("output", "")),
+            "stdout": str(raw_event.get("stdout", "")),
+            "stderr": str(raw_event.get("stderr", "")),
+            "duration_ms": int(raw_event.get("duration_ms", metadata.get("duration_ms", 0)) or 0),
+            "decision_source": str(raw_event.get("decision_source", metadata.get("decision_source", ""))),
+            "ok": bool(raw_event.get("ok", False)),
+            "exit_code": int(raw_event.get("exit_code", 1)),
+            "metadata": metadata,
+        }
+        return normalized
+
+    @staticmethod
+    def _normalize_planner_trace(raw_trace: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_trace, dict):
+            return None
+        metadata = raw_trace.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return {
+            "trace_id": str(raw_trace.get("trace_id") or uuid.uuid4().hex),
+            "timestamp": raw_trace.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            "stage": str(raw_trace.get("stage", "")),
+            "request": str(raw_trace.get("request", "")),
+            "response": str(raw_trace.get("response", "")),
+            "ok": bool(raw_trace.get("ok", False)),
+            "error_code": str(raw_trace.get("error_code", "")),
+            "used_profile": str(raw_trace.get("used_profile", "")),
+            "attempts": raw_trace.get("attempts", []),
+            "metadata": metadata,
         }
 
     def load_payload(self) -> dict[str, Any]:
@@ -44,15 +104,36 @@ class HistoryService:
                 payload = {"version": 1, "messages": payload}
             if not isinstance(payload, dict):
                 payload = self._default_payload()
-            payload["version"] = 2
+            payload_version = int(payload.get("version", 1) or 1)
+            payload["version"] = 4
             payload.setdefault("messages", [])
             payload.setdefault("events", [])
+            payload.setdefault("planner_traces", [])
             if not isinstance(payload["messages"], list):
                 payload["messages"] = []
             if not isinstance(payload["events"], list):
                 payload["events"] = []
+            if not isinstance(payload["planner_traces"], list):
+                payload["planner_traces"] = []
             if not payload["messages"]:
                 payload["messages"] = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
+
+            normalized_events: list[dict[str, Any]] = []
+            for raw_event in payload["events"]:
+                normalized_event = self._normalize_event(raw_event)
+                if normalized_event is not None:
+                    normalized_events.append(normalized_event)
+            payload["events"] = normalized_events
+
+            normalized_traces: list[dict[str, Any]] = []
+            for raw_trace in payload["planner_traces"]:
+                normalized_trace = self._normalize_planner_trace(raw_trace)
+                if normalized_trace is not None:
+                    normalized_traces.append(normalized_trace)
+            payload["planner_traces"] = normalized_traces
+
+            if payload_version < 4:
+                payload["version"] = 4
             atomic_write_json(self.path_manager.history_path, payload)
             return payload
 
@@ -70,6 +151,10 @@ class HistoryService:
     def list_events(self) -> list[dict[str, Any]]:
         payload = self.load_payload()
         return payload.get("events", [])
+
+    def list_planner_traces(self) -> list[dict[str, Any]]:
+        payload = self.load_payload()
+        return payload.get("planner_traces", [])
 
     def append_message(self, role: str, content: str) -> None:
         payload = self.load_payload()
@@ -92,21 +177,68 @@ class HistoryService:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         payload = self.load_payload()
+        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        event_id = str(metadata_dict.get("event_id") or uuid.uuid4().hex)
+        trace_id = str(metadata_dict.get("trace_id") or event_id)
+        module = str(metadata_dict.get("module", ""))
+        phase = str(metadata_dict.get("phase", metadata_dict.get("stage", "")))
+        parent_event_id = str(metadata_dict.get("parent_event_id", ""))
         event: dict[str, Any] = {
+            "event_id": event_id,
+            "trace_id": trace_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event_type": event_type,
+            "module": module,
+            "phase": phase,
+            "parent_event_id": parent_event_id,
             "input": input_text,
             "output": output_text,
+            "stdout": str(metadata_dict.get("stdout", "")),
+            "stderr": str(metadata_dict.get("stderr", "")),
+            "duration_ms": int(metadata_dict.get("duration_ms", 0) or 0),
+            "decision_source": str(metadata_dict.get("decision_source", "")),
             "ok": bool(ok),
             "exit_code": int(exit_code),
+            "metadata": metadata_dict,
         }
-        if metadata:
-            event["metadata"] = metadata
 
         events = payload.setdefault("events", [])
         events.append(event)
-        if len(events) > self.settings.max_events:
+        if self.settings.max_events is not None and len(events) > self.settings.max_events:
             payload["events"] = events[-self.settings.max_events :]
+        self.save_payload(payload)
+
+    def append_planner_trace(
+        self,
+        *,
+        trace_id: str,
+        stage: str,
+        request: str,
+        response: str,
+        ok: bool,
+        error_code: str = "",
+        used_profile: str = "",
+        attempts: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        payload = self.load_payload()
+        traces = payload.setdefault("planner_traces", [])
+        traces.append(
+            {
+                "trace_id": str(trace_id or uuid.uuid4().hex),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "stage": str(stage),
+                "request": str(request),
+                "response": str(response),
+                "ok": bool(ok),
+                "error_code": str(error_code),
+                "used_profile": str(used_profile),
+                "attempts": attempts or [],
+                "metadata": metadata if isinstance(metadata, dict) else {},
+            }
+        )
+        if self.settings.max_planner_traces is not None and len(traces) > self.settings.max_planner_traces:
+            payload["planner_traces"] = traces[-self.settings.max_planner_traces :]
         self.save_payload(payload)
 
     def append_command_record(
@@ -165,6 +297,45 @@ class HistoryService:
             output_text = self._compact_text(str(event.get("output", "")), preview_limit)
             lines.append(
                 f"{index}. 输入: {input_text} | 输出: {output_text} | ok={event.get('ok', False)} code={event.get('exit_code', 1)}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        tokens = re.findall(r"[A-Za-z0-9_./\\-]+|[\u4e00-\u9fff]+", text.lower())
+        return {token for token in tokens if len(token) > 1}
+
+    def format_related_events(self, query: str, limit: int | None = None, payload: dict[str, Any] | None = None) -> str:
+        source = payload if payload is not None else self.load_payload()
+        events = source.get("events", [])
+        if not events:
+            return ""
+
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
+            return ""
+
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for event in events:
+            input_text = str(event.get("input", ""))
+            output_text = str(event.get("output", ""))
+            event_tokens = self._tokenize(f"{input_text}\n{output_text}")
+            score = len(query_tokens.intersection(event_tokens))
+            if score > 0:
+                scored.append((score, event))
+
+        if not scored:
+            return ""
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        max_items = limit if limit is not None else self.settings.related_event_limit
+        selected = [item[1] for item in scored[:max_items]]
+        lines = ["与当前任务相关的历史事件："]
+        for index, event in enumerate(selected, 1):
+            lines.append(
+                f"{index}. 输入: {self._compact_text(str(event.get('input', '')), 120)} "
+                f"| 输出: {self._compact_text(str(event.get('output', '')), 200)} "
+                f"| ok={event.get('ok', False)} code={event.get('exit_code', 1)}"
             )
         return "\n".join(lines)
 

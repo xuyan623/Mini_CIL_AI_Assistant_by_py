@@ -7,9 +7,11 @@ import traceback
 import sys
 from pathlib import Path
 
+from ai_assistant.command_rules import build_cli_command_rules_prompt
 from ai_assistant.models import CommandResult
 from ai_assistant.paths import get_path_manager
 from ai_assistant.services.ai_client import AIClient
+from ai_assistant.services.ai_gateway import AIGateway
 from ai_assistant.services.backup_service import BackupService
 from ai_assistant.services.chat_service import ChatService
 from ai_assistant.services.code_service import CodeService
@@ -74,6 +76,7 @@ class AppContext:
         self.config_service = ConfigService(self.path_manager)
         self.history_service = HistoryService(self.path_manager)
         self.ai_client = AIClient(self.config_service)
+        self.ai_gateway = AIGateway(self.ai_client)
         self.backup_service = BackupService(self.path_manager)
         self.file_service = FileService()
         self.context_service = ContextService(self.path_manager)
@@ -142,12 +145,15 @@ def _build_parser() -> RecordingArgumentParser:
         action_parser.add_argument("file")
         action_parser.add_argument("--start", type=int, required=True)
         action_parser.add_argument("--end", type=int, required=True)
+        if action in {"comment", "optimize"}:
+            action_parser.add_argument("--yes", action="store_true", help="自动确认写入")
 
     generate_parser = code_sub.add_parser("generate", help="生成代码")
     generate_parser.add_argument("file")
     generate_parser.add_argument("--start", type=int, required=True)
     generate_parser.add_argument("--end", type=int, required=True)
     generate_parser.add_argument("--desc", required=True)
+    generate_parser.add_argument("--yes", action="store_true", help="自动确认写入")
 
     summarize_parser = code_sub.add_parser("summarize", help="总结文件")
     summarize_parser.add_argument("file")
@@ -212,14 +218,17 @@ def _build_parser() -> RecordingArgumentParser:
     shell_sub = shell_parser.add_subparsers(dest="action", required=True)
     shell_run = shell_sub.add_parser("run")
     shell_run.add_argument("description")
-    shell_run.add_argument("--execute", action="store_true")
 
     return parser
 
 
-def _result_from_message(message: str, error_code: int = 1) -> CommandResult:
+def _result_from_message(
+    message: str,
+    error_code: int = 1,
+    data: dict[str, object] | None = None,
+) -> CommandResult:
     ok = not message.startswith("❌")
-    return CommandResult(ok, message, 0 if ok else error_code)
+    return CommandResult(ok, message, 0 if ok else error_code, data=data or {})
 
 
 def _handle_file(args: argparse.Namespace, ctx: AppContext) -> CommandResult:
@@ -242,13 +251,15 @@ def _handle_code(args: argparse.Namespace, ctx: AppContext) -> CommandResult:
     if args.action == "check":
         return _result_from_message(ctx.code_service.check(args.file, args.start, args.end))
     if args.action == "comment":
-        return _result_from_message(ctx.code_service.comment(args.file, args.start, args.end))
+        return _result_from_message(ctx.code_service.comment(args.file, args.start, args.end, yes=getattr(args, "yes", False)))
     if args.action == "explain":
         return _result_from_message(ctx.code_service.explain(args.file, args.start, args.end))
     if args.action == "optimize":
-        return _result_from_message(ctx.code_service.optimize(args.file, args.start, args.end))
+        return _result_from_message(ctx.code_service.optimize(args.file, args.start, args.end, yes=getattr(args, "yes", False)))
     if args.action == "generate":
-        return _result_from_message(ctx.code_service.generate(args.file, args.start, args.end, args.desc))
+        return _result_from_message(
+            ctx.code_service.generate(args.file, args.start, args.end, args.desc, yes=getattr(args, "yes", False))
+        )
     if args.action == "summarize":
         return _result_from_message(ctx.code_service.summarize(args.file))
     return CommandResult(False, "❌ 未知 code 子命令", 2)
@@ -274,24 +285,30 @@ def _handle_context(args: argparse.Namespace, ctx: AppContext) -> CommandResult:
         except ValueError as exc:
             return CommandResult(False, f"❌ {exc}", 1)
 
-        ctx.history_service.trim_and_summarize(ctx.ai_client.summarize_messages)
+        ctx.history_service.trim_and_summarize(ctx.ai_gateway.summarize_messages)
         messages = ctx.history_service.build_messages_for_request(
             user_prompt=prompt,
             include_recent_history=True,
             include_recent_events=True,
+            extra_system_messages=[build_cli_command_rules_prompt()],
         )
-        ok, response = ctx.ai_client.chat(
+        response = ctx.ai_gateway.chat(
             messages,
             stream_override=None,
             print_stream=True,
             timeout=90,
         )
-        if ok:
-            ctx.history_service.append_exchange(f"context ask: {args.question}", response)
-            return CommandResult(True, response)
+        stream_enabled = ctx.config_service.get_active_profile().stream
+        if response.ok:
+            ctx.history_service.append_exchange(f"context ask: {args.question}", response.content)
+            return CommandResult(
+                True,
+                response.content,
+                data={"streamed_output": bool(stream_enabled)},
+            )
 
-        ctx.history_service.append_exchange(f"context ask: {args.question}", response)
-        return CommandResult(False, response, 1)
+        ctx.history_service.append_exchange(f"context ask: {args.question}", response.content)
+        return CommandResult(False, response.content, 1, data={"streamed_output": False})
 
     return CommandResult(False, "❌ 未知 context 子命令", 2)
 
@@ -371,7 +388,7 @@ def _handle_config(args: argparse.Namespace, ctx: AppContext) -> CommandResult:
 
 
 def _handle_shell(args: argparse.Namespace, ctx: AppContext) -> CommandResult:
-    ok, message = ctx.shell_service.run(args.description, execute=args.execute)
+    ok, message = ctx.shell_service.run(args.description)
     return CommandResult(ok, message, 0 if ok else 1)
 
 
@@ -382,6 +399,18 @@ def _format_command_line(argv: list[str]) -> str:
 
 
 def _dispatch(argv: list[str], ctx: AppContext) -> CommandResult:
+    retry_aliases = {"重试", "再试", "再试一次", "retry", "try again", "继续"}
+    if len(argv) == 1 and argv[0].strip().lower() in retry_aliases:
+        ok, message = ctx.shell_service.run(argv[0].strip())
+        return CommandResult(ok, message, 0 if ok else 1, data={"module_hint": "shell"})
+
+    if "--execute" in argv:
+        return CommandResult(
+            False,
+            "❌ --execute 已下线，shell run 改为交互式分步执行：ai shell run \"查找大文件\"",
+            2,
+        )
+
     if argv and argv[0].startswith("/"):
         return CommandResult(False, _migration_message(argv[0]), 2)
 
@@ -389,7 +418,13 @@ def _dispatch(argv: list[str], ctx: AppContext) -> CommandResult:
     if argv and argv[0] not in known_modules and not argv[0].startswith("-"):
         message = " ".join(argv).strip()
         output = ctx.chat_service.chat(message, use_history=True)
-        return _result_from_message(output, error_code=1)
+        stream_enabled = ctx.config_service.get_active_profile().stream
+        suppress_print = bool(stream_enabled) and not output.startswith("❌")
+        return _result_from_message(
+            output,
+            error_code=1,
+            data={"streamed_output": suppress_print, "module_hint": "chat"},
+        )
 
     parser = _build_parser()
     try:
@@ -409,7 +444,13 @@ def _dispatch(argv: list[str], ctx: AppContext) -> CommandResult:
         if not message:
             return CommandResult(False, "❌ chat 需要消息文本，例如：ai chat 你好", 2)
         output = ctx.chat_service.chat(message, use_history=not args.no_history)
-        return _result_from_message(output, error_code=1)
+        stream_enabled = ctx.config_service.get_active_profile().stream
+        suppress_print = bool(stream_enabled) and not output.startswith("❌")
+        return _result_from_message(
+            output,
+            error_code=1,
+            data={"streamed_output": suppress_print},
+        )
 
     handlers = {
         "file": _handle_file,
@@ -439,7 +480,8 @@ def run(argv: list[str] | None = None) -> int:
         traceback_text = traceback.format_exc()
         result = CommandResult(False, f"❌ 内部错误：{exc}", 1, data={"traceback": traceback_text})
 
-    if result.message:
+    suppress_print = bool(result.data and result.data.get("streamed_output"))
+    if result.message and not suppress_print:
         print(result.message)
 
     history_output = result.message
@@ -452,7 +494,7 @@ def run(argv: list[str] | None = None) -> int:
             output_text=history_output,
             ok=result.ok,
             exit_code=result.exit_code,
-            metadata={"module": argv[0] if argv else "none"},
+            metadata={"module": (result.data or {}).get("module_hint") or (argv[0] if argv else "none")},
         )
     except Exception:
         pass

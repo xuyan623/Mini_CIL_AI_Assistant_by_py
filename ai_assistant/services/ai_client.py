@@ -22,6 +22,75 @@ class AIClient:
             return match.group("body").rstrip()
         return text
 
+    @staticmethod
+    def _extract_text_fragment(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, list):
+            chunks: list[str] = []
+            for item in value:
+                fragment = AIClient._extract_text_fragment(item)
+                if fragment:
+                    chunks.append(fragment)
+            return "".join(chunks)
+        if isinstance(value, dict):
+            for key in ("text", "content", "value", "reasoning_content", "output_text", "output"):
+                fragment = AIClient._extract_text_fragment(value.get(key))
+                if fragment:
+                    return fragment
+            return ""
+        return str(value)
+
+    @staticmethod
+    def _extract_non_stream_content(data: dict[str, Any]) -> str:
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first_choice = choices[0] if isinstance(choices[0], dict) else {}
+            message = first_choice.get("message", {}) if isinstance(first_choice, dict) else {}
+
+            if isinstance(message, dict):
+                content = AIClient._extract_text_fragment(message.get("content"))
+                reasoning = AIClient._extract_text_fragment(message.get("reasoning_content"))
+                if content:
+                    return content
+                if reasoning:
+                    return reasoning
+
+            text_choice = AIClient._extract_text_fragment(first_choice.get("text"))
+            if text_choice:
+                return text_choice
+
+        for key in ("output_text", "text", "content", "output", "response"):
+            extracted = AIClient._extract_text_fragment(data.get(key))
+            if extracted:
+                return extracted
+        return ""
+
+    @staticmethod
+    def _extract_stream_chunk_content(data: dict[str, Any]) -> str:
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first_choice = choices[0] if isinstance(choices[0], dict) else {}
+            if isinstance(first_choice, dict):
+                delta_payload = first_choice.get("delta")
+                extracted_delta = AIClient._extract_text_fragment(delta_payload)
+                if extracted_delta:
+                    return extracted_delta
+                for key in ("content", "text", "reasoning_content", "output_text"):
+                    extracted = AIClient._extract_text_fragment(first_choice.get(key))
+                    if extracted:
+                        return extracted
+
+        for key in ("output_text", "text", "content", "output", "response"):
+            extracted = AIClient._extract_text_fragment(data.get(key))
+            if extracted:
+                return extracted
+        return ""
+
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -30,8 +99,14 @@ class AIClient:
         max_tokens: int | None = None,
         timeout: int = 60,
         print_stream: bool = False,
+        profile_override: str | None = None,
     ) -> tuple[bool, str]:
-        profile = self.config_service.get_active_profile()
+        if profile_override:
+            profile = self.config_service.get_profile(profile_override)
+            if profile is None:
+                return False, f"❌ 配置不存在：{profile_override}"
+        else:
+            profile = self.config_service.get_active_profile()
         stream = profile.stream if stream_override is None else stream_override
 
         if not profile.api_key:
@@ -64,7 +139,21 @@ class AIClient:
                     data = json.loads(raw)
                     if "error" in data:
                         return False, f"❌ API 错误：{data['error'].get('message', 'unknown')}"
-                    content = data["choices"][0]["message"]["content"]
+                    content = self._extract_non_stream_content(data)
+                    if not content.strip():
+                        # 部分兼容层在非流式下返回空文本，回退尝试流式读取一次。
+                        retry_ok, retry_content = self.chat(
+                            messages,
+                            stream_override=True,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            timeout=timeout,
+                            print_stream=False,
+                            profile_override=profile_override,
+                        )
+                        if retry_ok and retry_content.strip():
+                            return True, retry_content
+                        return False, "❌ API 返回空内容"
                     return True, content
 
                 chunks: list[str] = []
@@ -93,7 +182,7 @@ class AIClient:
                     if "error" in data:
                         return False, f"❌ API 错误：{data['error'].get('message', 'unknown')}"
 
-                    delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                    delta = self._extract_stream_chunk_content(data)
                     if delta:
                         if print_stream:
                             print(delta, end="", flush=True)

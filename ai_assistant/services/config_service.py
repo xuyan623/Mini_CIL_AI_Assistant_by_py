@@ -86,6 +86,8 @@ class ConfigService:
 
     @staticmethod
     def _warn_if_plaintext(payload: dict[str, Any]) -> None:
+        if os.environ.get("AI_SUPPRESS_PLAINTEXT_WARN") == "1":
+            return
         if ConfigService._warned_plaintext:
             return
         for profile in payload.get("profiles", {}).values():
@@ -146,6 +148,24 @@ class ConfigService:
             model=profile.get("model", ""),
             stream=bool(profile.get("stream", False)),
         )
+
+    def get_profile(self, profile_id: str) -> ProfileConfig | None:
+        payload = self.load_payload()
+        profile = payload["profiles"].get(profile_id)
+        if not isinstance(profile, dict):
+            return None
+        return ProfileConfig(
+            profile_id=profile_id,
+            name=profile.get("name", profile_id),
+            api_key=profile.get("api_key", ""),
+            api_url=profile.get("api_url", ""),
+            model=profile.get("model", ""),
+            stream=bool(profile.get("stream", False)),
+        )
+
+    def list_profile_ids(self) -> list[str]:
+        payload = self.load_payload()
+        return list(payload.get("profiles", {}).keys())
 
     def add_profile(
         self,

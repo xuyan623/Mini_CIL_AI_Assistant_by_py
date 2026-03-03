@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import json
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -13,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from ai_assistant.paths import PathManager
 from ai_assistant.services.backup_service import BackupService
+from ai_assistant.services.ai_client import AIClient
 from ai_assistant.services.chat_service import ChatService
 from ai_assistant.services.code_service import CodeService
 from ai_assistant.services.config_service import ConfigService
@@ -22,12 +26,22 @@ from ai_assistant.services.shell_service import ShellService
 
 
 class FakeAIClient:
-    def __init__(self, response: str = "ok") -> None:
+    def __init__(
+        self,
+        response: str = "ok",
+        responses: list[str | tuple[bool, str]] | None = None,
+    ) -> None:
         self.response = response
+        self.responses = list(responses or [])
         self.calls: list[list[dict[str, str]]] = []
 
     def chat(self, messages: list[dict[str, str]], **kwargs: object) -> tuple[bool, str]:
         self.calls.append(messages)
+        if self.responses:
+            item = self.responses.pop(0)
+            if isinstance(item, tuple):
+                return item
+            return True, item
         return True, self.response
 
     @staticmethod
@@ -122,6 +136,35 @@ class HistoryServiceTests(EnvMixin, unittest.TestCase):
         self.assertIn("messages", payload)
         self.assertGreater(len(payload["messages"]), 1)
 
+    def test_history_v2_payload_is_auto_migrated_to_v4(self) -> None:
+        manager = PathManager(project_root=self.project_root)
+        history_path = manager.history_path
+        legacy_payload = {
+            "version": 2,
+            "messages": [{"role": "system", "content": "legacy"}],
+            "events": [
+                {
+                    "timestamp": "2025-01-01T00:00:00+00:00",
+                    "event_type": "command",
+                    "input": "ai file ls .",
+                    "output": "ok",
+                    "ok": True,
+                    "exit_code": 0,
+                }
+            ],
+        }
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_path.write_text(json.dumps(legacy_payload, ensure_ascii=False), encoding="utf-8")
+
+        service = HistoryService(manager)
+        migrated_payload = service.load_payload()
+        self.assertEqual(migrated_payload.get("version"), 4)
+        self.assertTrue(migrated_payload.get("events"))
+        self.assertIn("planner_traces", migrated_payload)
+        first_event = migrated_payload["events"][0]
+        self.assertIn("event_id", first_event)
+        self.assertIn("trace_id", first_event)
+
 
 class ConfigServiceTests(EnvMixin, unittest.TestCase):
     def test_stream_setting_and_export_import(self) -> None:
@@ -170,6 +213,380 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         self.assertFalse(report.safe)
         self.assertTrue(any("远程脚本" in warning for warning in report.warnings))
 
+    def test_generate_command_handles_empty_ai_response(self) -> None:
+        fake_client = FakeAIClient(response="")
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, message = service.generate_command("列出当前目录文件")
+        self.assertFalse(ok)
+        self.assertIn("未生成有效命令", message)
+
+    def test_generate_command_requires_filename_for_comment_intent(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"capability_id":"code.comment","parameters":{},"missing_parameters":["file"],"note":"❌ 描述缺少目标文件名，请补充例如：test123.c"}'
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, message = service.generate_command("帮我添加注释")
+        self.assertFalse(ok)
+        self.assertIn("缺少目标文件名", message)
+
+    def test_generate_command_builds_placeholder_workflow_when_file_missing(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"capability_id":"code.comment","parameters":{"file":"test123.c"},"missing_parameters":[],"note":""}'
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, command_text = service.generate_command("我想为test123.c添加注释")
+        self.assertTrue(ok)
+        self.assertIn("find . -type f -name", command_text)
+        self.assertIn("ai code comment <FILE_PATH> --start 1 --end <END_LINE> --yes", command_text)
+
+    def test_generate_command_rejects_incomplete_ai_code_command(self) -> None:
+        fake_client = FakeAIClient(response="ai code check test123.c")
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, message = service.generate_command("帮我生成一个可执行命令")
+        self.assertFalse(ok)
+        self.assertIn("缺少必要参数", message)
+        self.assertIn("--start", message)
+        self.assertIn("--end", message)
+
+    def test_generate_comment_workflow_uses_runtime_end_line(self) -> None:
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+
+        target = self.base / "Sam.c"
+        target.write_text("int main() {\\n  return 0;\\n}\\n", encoding="utf-8")
+        fake_client = FakeAIClient(
+            responses=[
+                json.dumps(
+                    {
+                        "capability_id": "code.comment",
+                        "parameters": {"file": str(target)},
+                        "missing_parameters": [],
+                        "note": "",
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, command_text = service.generate_command(f"我想为{target}添加注释")
+        self.assertTrue(ok)
+        self.assertIn("ai code comment", command_text)
+        self.assertIn("--yes", command_text)
+        self.assertIn('--end "$(lines=$(wc -l <', command_text)
+
+    def test_generate_bug_fix_workflow_prefers_internal_code_commands(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"capability_id":"workflow.code_fix","parameters":{"file":"Sam.c"},"missing_parameters":[],"note":""}'
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        target = self.base / "Sam.c"
+        target.write_text("int main() {\n  return 0;\n}\n", encoding="utf-8")
+
+        ok, command_text = service.generate_command(f"检查并修改{target}中的bug")
+        self.assertTrue(ok)
+        self.assertIn("ai code check", command_text)
+        self.assertIn("ai code optimize", command_text)
+        self.assertNotIn("gcc -Wall", command_text)
+
+    def test_generate_check_fix_workflow_without_bug_keyword(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"capability_id":"workflow.code_fix","parameters":{"file":"Sam.c"},"missing_parameters":[],"note":""}'
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        target = self.base / "Sam.c"
+        target.write_text("int main() {\n  return 0;\n}\n", encoding="utf-8")
+        ok, command_text = service.generate_command(f"检查并修复{target}")
+        self.assertTrue(ok)
+        self.assertIn("ai code check", command_text)
+        self.assertIn("ai code optimize", command_text)
+
+    def test_generate_apply_suggestion_workflow_uses_optimize(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"capability_id":"code.optimize","parameters":{"file":"Sam.c"},"missing_parameters":[],"note":""}'
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        target = self.base / "Sam.c"
+        target.write_text("int main() {\n  return 0;\n}\n", encoding="utf-8")
+        ok, command_text = service.generate_command(f"根据修改建议修改{target}")
+        self.assertTrue(ok)
+        self.assertIn("ai code optimize", command_text)
+
+    def test_generate_fix_intent_without_filename_returns_error(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"capability_id":"code.optimize","parameters":{},"missing_parameters":["file"],"note":"❌ 描述缺少目标文件名，请补充例如：test123.c"}'
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, message = service.generate_command("利用你自己的指令去修改")
+        self.assertFalse(ok)
+        self.assertIn("缺少目标文件名", message)
+
+    def test_generate_directory_ensure_workflow_without_ai(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"capability_id":"workflow.ensure_directory","parameters":{"base_dir":"./mycode","dir_name":"AI"},"missing_parameters":[],"note":""}'
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, command_text = service.generate_command("./mycode目录下有没有一个文件夹叫AI，如果有则告诉我路径，如果没有则创建他")
+        self.assertTrue(ok)
+        self.assertIn("mkdir -p", command_text)
+        self.assertIn("if [ -d ", command_text)
+        self.assertGreaterEqual(len(fake_client.calls), 1)
+
+    def test_run_non_interactive_keeps_generate_only_behavior(self) -> None:
+        fake_client = FakeAIClient(response="echo hello")
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        with mock.patch("sys.stdin.isatty", return_value=False):
+            ok, message = service.run("打印 hello")
+        self.assertTrue(ok)
+        self.assertIn("非交互模式", message)
+
+    def test_run_interactive_can_cancel_execution(self) -> None:
+        fake_client = FakeAIClient(response="echo hello")
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        with mock.patch("sys.stdin.isatty", return_value=True):
+            with mock.patch.object(ShellService, "_confirm_with_prompt", return_value=(False, "n")):
+                ok, message = service.run("打印 hello")
+        self.assertTrue(ok)
+        self.assertIn("已取消执行", message)
+
+    def test_run_interactive_executes_step_and_records_history(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"steps":[{"command":"echo hello","purpose":"打印"}]}',
+                '{"action":"done","message":"完成"}',
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        with mock.patch("sys.stdin.isatty", return_value=True):
+            with mock.patch.object(
+                ShellService,
+                "_confirm_with_prompt",
+                side_effect=[(True, "y"), (True, "y")],
+            ):
+                with mock.patch(
+                    "subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        args="echo hello",
+                        returncode=0,
+                        stdout="hello\n",
+                        stderr="",
+                    ),
+                ):
+                    ok, message = service.run("打印 hello")
+
+        self.assertTrue(ok)
+        self.assertIn("完成", message)
+        events = history.list_events()
+        self.assertTrue(any(item.get("event_type") == "shell_step" for item in events))
+
+    def test_run_model_replans_using_previous_step_output(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"steps":[{"command":"echo one","purpose":"step1"}]}',
+                '{"action":"next","command":"echo two","message":"继续"}',
+                '{"action":"done","message":"完成"}',
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        run_outputs = [
+            subprocess.CompletedProcess(args="echo one", returncode=0, stdout="one\n", stderr=""),
+            subprocess.CompletedProcess(args="echo two", returncode=0, stdout="two\n", stderr=""),
+        ]
+        with mock.patch("sys.stdin.isatty", return_value=True):
+            with mock.patch.object(
+                ShellService,
+                "_confirm_with_prompt",
+                side_effect=[(True, "y"), (True, "y"), (True, "y")],
+            ):
+                with mock.patch("subprocess.run", side_effect=run_outputs):
+                    emitted: list[str] = []
+                    with mock.patch.object(ShellService, "_emit_runtime_output", side_effect=emitted.append):
+                        ok, message = service.run("做两步演示")
+
+        self.assertTrue(ok)
+        self.assertIn("完成", message)
+        merged = "\n".join(emitted)
+        self.assertIn("继续", merged)
+        self.assertIn("one", merged)
+        self.assertIn("two", merged)
+
+    def test_run_handles_bytes_stdout_without_crash(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"steps":[{"command":"echo hello","purpose":"打印"}]}',
+                '{"action":"done","message":"完成"}',
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        with mock.patch("sys.stdin.isatty", return_value=True):
+            with mock.patch.object(
+                ShellService,
+                "_confirm_with_prompt",
+                side_effect=[(True, "y"), (True, "y")],
+            ):
+                with mock.patch(
+                    "subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        args="echo hello",
+                        returncode=0,
+                        stdout=b"hello\n",
+                        stderr=b"",
+                    ),
+                ):
+                    ok, message = service.run("打印 hello")
+
+        self.assertTrue(ok)
+        self.assertIn("完成", message)
+
+    def test_retry_uses_previous_shell_plan_description(self) -> None:
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        fake_client = FakeAIClient(response="ls -la")
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        target = self.base / "Sam.c"
+        target.write_text("int main() {\n  return 0;\n}\n", encoding="utf-8")
+        history.append_event(
+            event_type="shell_plan",
+            input_text=f"我需要为{target}添加注释",
+            output_text="",
+            ok=True,
+            exit_code=0,
+        )
+
+        with mock.patch("sys.stdin.isatty", return_value=False):
+            ok, message = service.run("重试")
+
+        self.assertTrue(ok)
+        self.assertIn("重试上次任务", message)
+        self.assertIn(str(target), message)
+
+    def test_retry_without_history_returns_error(self) -> None:
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        fake_client = FakeAIClient(response="ls -la")
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        with mock.patch("sys.stdin.isatty", return_value=False):
+            ok, message = service.run("重试")
+
+        self.assertFalse(ok)
+        self.assertIn("未找到可重试任务", message)
+
+    def test_timeout_on_ai_code_comment_is_auto_adjusted(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"steps":[{"command":"ai code comment demo.c --start 1 --end 3","purpose":"注释"}]}',
+                (False, "planner parse failed"),
+                '{"action":"done","message":"完成"}',
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        run_outputs = [
+            subprocess.CompletedProcess(
+                args="ai code comment demo.c --start 1 --end 3",
+                returncode=124,
+                stdout="",
+                stderr="命令超时（30s）",
+            ),
+            subprocess.CompletedProcess(
+                args="ai code comment demo.c --start 1 --end 3 --yes",
+                returncode=0,
+                stdout="done",
+                stderr="",
+            ),
+        ]
+
+        with mock.patch("sys.stdin.isatty", return_value=True):
+            with mock.patch.object(
+                ShellService,
+                "_confirm_with_prompt",
+                side_effect=[(True, "y"), (True, "y"), (True, "y")],
+            ):
+                with mock.patch("subprocess.run", side_effect=run_outputs):
+                    with mock.patch.object(ShellService, "_emit_runtime_output"):
+                        ok, message = service.run("执行 demo 工作流")
+
+        self.assertTrue(ok)
+        self.assertIn("完成", message)
+
 
 class AIPromptCompositionTests(EnvMixin, unittest.TestCase):
     def setUp(self) -> None:
@@ -200,6 +617,7 @@ class AIPromptCompositionTests(EnvMixin, unittest.TestCase):
         self.assertIn("之前提问", merged)
         self.assertIn("ai file ls .", merged)
         self.assertIn("ctx.py", merged)
+        self.assertIn("可用 CLI 命令规范", merged)
 
     def test_code_service_uses_history_events_and_context(self) -> None:
         fake_client = FakeAIClient(response="code-response")
@@ -220,6 +638,21 @@ class AIPromptCompositionTests(EnvMixin, unittest.TestCase):
         self.assertIn("ai file ls .", merged)
         self.assertIn("ctx.py", merged)
         self.assertIn("value = 1", merged)
+        self.assertIn("可用 CLI 命令规范", merged)
+
+    def test_code_service_check_rejects_empty_ai_result(self) -> None:
+        fake_client = FakeAIClient(response="")
+        service = CodeService(
+            ai_client=fake_client,
+            backup_service=BackupService(self.manager),
+            history_service=self.history,
+            context_service=self.context,
+        )
+
+        target_file = self.base / "empty_check.py"
+        target_file.write_text("value = 1\n", encoding="utf-8")
+        output = service.check(str(target_file), 1, 1)
+        self.assertIn("AI 未返回有效检查结果", output)
 
     def test_shell_service_uses_history_events_and_context(self) -> None:
         fake_client = FakeAIClient(response="ls -la")
@@ -233,6 +666,65 @@ class AIPromptCompositionTests(EnvMixin, unittest.TestCase):
         self.assertIn("之前提问", merged)
         self.assertIn("ai file ls .", merged)
         self.assertIn("ctx.py", merged)
+        self.assertIn("可用 CLI 命令规范", merged)
+
+
+class AIClientParsingTests(unittest.TestCase):
+    def test_extract_non_stream_content_from_message_parts(self) -> None:
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "line1"},
+                            {"type": "text", "text": "\nline2"},
+                        ]
+                    }
+                }
+            ]
+        }
+        self.assertEqual(AIClient._extract_non_stream_content(payload), "line1\nline2")
+
+    def test_extract_non_stream_content_from_reasoning(self) -> None:
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "reason-only",
+                    }
+                }
+            ]
+        }
+        self.assertEqual(AIClient._extract_non_stream_content(payload), "reason-only")
+
+    def test_extract_non_stream_content_from_output_array(self) -> None:
+        payload = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "hello"},
+                        {"type": "output_text", "text": " world"},
+                    ],
+                }
+            ]
+        }
+        self.assertEqual(AIClient._extract_non_stream_content(payload), "hello world")
+
+    def test_extract_stream_chunk_content_from_reasoning_delta(self) -> None:
+        payload = {
+            "choices": [
+                {
+                    "delta": {
+                        "reasoning_content": [
+                            {"type": "text", "text": "推理片段"},
+                        ]
+                    }
+                }
+            ]
+        }
+        self.assertEqual(AIClient._extract_stream_chunk_content(payload), "推理片段")
 
 
 if __name__ == "__main__":

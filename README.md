@@ -80,6 +80,11 @@ python ai.py code comment app.py --start 10 --end 40
 python ai.py code optimize app.py --start 10 --end 40
 python ai.py code generate app.py --start 1 --end 1 --desc "add argparse import"
 python ai.py code summarize app.py
+
+# 非交互写入（适合 shell 分步自动执行）
+python ai.py code comment app.py --start 10 --end 40 --yes
+python ai.py code optimize app.py --start 10 --end 40 --yes
+python ai.py code generate app.py --start 1 --end 1 --desc "add argparse import" --yes
 ```
 
 ### context 代码上下文
@@ -119,8 +124,21 @@ python ai.py config import ./deepseek.profile.json --profile deepseek_copy
 
 ```bash
 python ai.py shell run "查找大于 100M 的文件"
-python ai.py shell run "查找大于 100M 的文件" --execute
 ```
+
+运行流程：
+
+1. 先用模型将自然语言解析为结构化任务，并生成首批步骤草案
+2. 询问是否开始执行（`y/n`）
+3. 每一步执行前再次确认（`y/n`）
+4. 每一步执行后立即输出结果并写入历史
+5. 下一步会基于上一步 `stdout/stderr/exit code` 重新规划，不是机械照抄草案
+
+说明：
+
+1. `--execute` 已下线，不再支持
+2. 非交互终端只生成步骤，不会执行
+3. 当模型返回空内容或失败时，会自动尝试其他已配置模型兜底
 
 ## 4. 让 `ai` 命令可直接使用（可选）
 
@@ -145,7 +163,7 @@ ai -h
 主要文件：
 
 1. `assistant-config/profiles.json`：模型配置
-2. `assistant-state/history.json`：输入输出历史
+2. `assistant-state/history.json`：输入输出历史（含 messages/events/planner_traces）
 3. `assistant-state/context.json`：代码上下文
 4. `assistant-data/backup_index.json`：备份索引
 

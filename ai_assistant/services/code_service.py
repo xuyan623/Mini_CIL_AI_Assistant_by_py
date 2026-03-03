@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ai_assistant.command_rules import build_cli_command_rules_prompt
 from ai_assistant.services.ai_client import AIClient
+from ai_assistant.services.ai_gateway import AIGateway
 from ai_assistant.services.backup_service import BackupService
 from ai_assistant.services.context_service import ContextService
 from ai_assistant.services.history_service import HistoryService
@@ -17,6 +19,7 @@ class CodeService:
         context_service: ContextService | None = None,
     ) -> None:
         self.ai_client = ai_client or AIClient()
+        self.ai_gateway = AIGateway(self.ai_client)
         self.backup_service = backup_service or BackupService()
         self.history_service = history_service or HistoryService()
         self.context_service = context_service or ContextService()
@@ -42,12 +45,15 @@ class CodeService:
         return True, snippet, lines, total
 
     @staticmethod
-    def _preview_and_confirm(title: str, content: str) -> bool:
+    def _preview_and_confirm(title: str, content: str, auto_confirm: bool = False) -> bool:
         print("=" * 60)
         print(f"📝 {title} 预览")
         print("=" * 60)
         print(content)
         print("=" * 60)
+        if auto_confirm:
+            print("✅ 已自动确认写入（--yes）")
+            return True
         try:
             answer = input("是否确认写入？(y/n): ").strip().lower()
         except EOFError:
@@ -55,20 +61,31 @@ class CodeService:
         return answer == "y"
 
     def _build_extra_system_messages(self) -> list[str]:
+        messages = [build_cli_command_rules_prompt()]
         context_block = self.context_service.render_context_block(max_chars=12000)
-        if not context_block:
-            return []
-        return [f"当前会话激活了代码上下文，回答时如果相关必须结合：\n{context_block}"]
+        if context_block:
+            messages.append(f"当前会话激活了代码上下文，回答时如果相关必须结合：\n{context_block}")
+        return messages
 
     def _ask_ai(self, prompt: str, temperature: float = 0.2) -> tuple[bool, str]:
-        self.history_service.trim_and_summarize(self.ai_client.summarize_messages)
+        self.history_service.trim_and_summarize(self.ai_gateway.summarize_messages)
         messages = self.history_service.build_messages_for_request(
             user_prompt=prompt,
             include_recent_history=True,
             include_recent_events=True,
             extra_system_messages=self._build_extra_system_messages(),
         )
-        return self.ai_client.chat(messages, stream_override=False, temperature=temperature, max_tokens=4096, timeout=90)
+        response = self.ai_gateway.chat(
+            messages,
+            stream_override=False,
+            temperature=temperature,
+            max_tokens=4096,
+            timeout=90,
+            print_stream=False,
+        )
+        if not response.ok and response.error_code == "empty_content":
+            return True, ""
+        return response.ok, response.content
 
     def check(self, file_path: str, start_line: int, end_line: int) -> str:
         ok, content_or_error, path = self._read_text_file(file_path)
@@ -86,6 +103,8 @@ class CodeService:
         success, response = self._ask_ai(prompt, temperature=0.2)
         if not success:
             return response
+        if not response.strip():
+            return "❌ AI 未返回有效检查结果"
         return f"📝 代码检查结果 | 文件：{path}（行 {start_line}-{end_line}）\n{response}"
 
     def explain(self, file_path: str, start_line: int, end_line: int) -> str:
@@ -101,6 +120,8 @@ class CodeService:
         success, response = self._ask_ai(prompt, temperature=0.2)
         if not success:
             return response
+        if not response.strip():
+            return "❌ AI 未返回有效解释结果"
         return f"📝 代码解释结果 | 文件：{path}（行 {start_line}-{end_line}）\n{response}"
 
     def summarize(self, file_path: str) -> str:
@@ -115,15 +136,24 @@ class CodeService:
         success, response = self._ask_ai(prompt, temperature=0.2)
         if not success:
             return response
+        if not response.strip():
+            return "❌ AI 未返回有效总结结果"
         return f"📝 文件总结 | 文件：{path}\n{response}"
 
-    def comment(self, file_path: str, start_line: int, end_line: int) -> str:
-        return self._modify_range(file_path, start_line, end_line, "comment")
+    def comment(self, file_path: str, start_line: int, end_line: int, yes: bool = False) -> str:
+        return self._modify_range(file_path, start_line, end_line, "comment", auto_confirm=yes)
 
-    def optimize(self, file_path: str, start_line: int, end_line: int) -> str:
-        return self._modify_range(file_path, start_line, end_line, "optimize")
+    def optimize(self, file_path: str, start_line: int, end_line: int, yes: bool = False) -> str:
+        return self._modify_range(file_path, start_line, end_line, "optimize", auto_confirm=yes)
 
-    def _modify_range(self, file_path: str, start_line: int, end_line: int, mode: str) -> str:
+    def _modify_range(
+        self,
+        file_path: str,
+        start_line: int,
+        end_line: int,
+        mode: str,
+        auto_confirm: bool = False,
+    ) -> str:
         ok, content_or_error, path = self._read_text_file(file_path)
         if not ok:
             return content_or_error
@@ -153,7 +183,7 @@ class CodeService:
         if not new_snippet:
             return "❌ AI 未返回有效代码"
 
-        if not self._preview_and_confirm(preview_title, new_snippet):
+        if not self._preview_and_confirm(preview_title, new_snippet, auto_confirm=auto_confirm):
             return "✅ 已取消"
 
         backup_ok, backup_message = self.backup_service.create_backup(str(path))
@@ -168,7 +198,7 @@ class CodeService:
         path.write_text("".join(merged), encoding="utf-8")
         return f"{backup_message}\n✅ 文件已更新：{path}（行 {start_line}-{end_line}）"
 
-    def generate(self, file_path: str, start_line: int, end_line: int, description: str) -> str:
+    def generate(self, file_path: str, start_line: int, end_line: int, description: str, yes: bool = False) -> str:
         ok, content_or_error, path = self._read_text_file(file_path)
         if not ok:
             return content_or_error
@@ -191,7 +221,7 @@ class CodeService:
         if not generated:
             return "❌ AI 未生成有效代码"
 
-        if not self._preview_and_confirm("代码生成", generated):
+        if not self._preview_and_confirm("代码生成", generated, auto_confirm=yes):
             return "✅ 已取消"
 
         backup_ok, backup_message = self.backup_service.create_backup(str(path))
