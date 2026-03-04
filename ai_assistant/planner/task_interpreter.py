@@ -11,6 +11,7 @@ from ai_assistant.planner.types import TaskSpec
 
 class TaskInterpreter:
     retry_tokens = {"重试", "再试", "再试一次", "retry", "try again", "继续"}
+    reference_tokens = ("这个文件", "该文件", "它", "上一步文件", "刚刚找到的文件", "this file", "that file")
 
     @staticmethod
     def _extract_file_candidate(description: str) -> str | None:
@@ -18,6 +19,116 @@ class TaskInterpreter:
         if not match:
             return None
         return match.group(1).strip()
+
+    @classmethod
+    def _contains_reference_token(cls, description: str) -> bool:
+        lowered = (description or "").lower()
+        return any(token in lowered for token in cls.reference_tokens)
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        return {token for token in re.findall(r"[A-Za-z0-9_./\\-]+|[\u4e00-\u9fff]+", text.lower()) if token}
+
+    def _match_capability_from_description(self, normalized_description: str) -> str | None:
+        lowered = normalized_description.lower()
+        tokens = self._tokenize(normalized_description)
+        file_candidate = self._extract_file_candidate(normalized_description)
+        has_reference = self._contains_reference_token(normalized_description)
+        best_capability_id = ""
+        best_score = 0.0
+
+        for capability in list_capabilities():
+            if capability.capability_id == "chat.chat":
+                continue
+
+            score = 0.0
+            action_token = capability.action.lower()
+            module_token = capability.module.lower()
+            summary_token = capability.summary.lower()
+
+            if action_token and action_token in lowered:
+                score += 1.2
+            if module_token and module_token in lowered:
+                score += 0.8
+            if summary_token and summary_token in lowered:
+                score += 1.5
+
+            for alias in capability.aliases:
+                alias_text = alias.lower()
+                if alias_text and alias_text in lowered:
+                    score += 2.6
+
+            required_names = {parameter.name for parameter in capability.required_parameters}
+            if "file" in required_names and file_candidate:
+                score += 1.6
+            if "file" in required_names and has_reference and not file_candidate:
+                score += 1.2
+
+            if capability.capability_id == "workflow.code_fix" and any(token in lowered for token in ("修复", "bug", "问题", "检查并修改", "检查并修复")):
+                score += 2.0
+            if capability.capability_id == "workflow.code_fix" and any(token in lowered for token in ("修改", "建议")):
+                score += 1.2
+            if capability.capability_id in {"workflow.code_fix", "code.optimize"} and any(token in lowered for token in ("修改", "建议")):
+                score += 1.2
+            if capability.capability_id == "backup.create" and any(token in lowered for token in ("备份", "backup")):
+                score += 2.6
+            if capability.capability_id == "workflow.ensure_directory" and any(token in lowered for token in ("目录", "文件夹", "folder", "directory")):
+                score += 1.8
+            if capability.capability_id.startswith("code.") and any(token in tokens for token in {"代码", "code", "c", "py", "cpp"}):
+                score += 0.4
+
+            if score > best_score:
+                best_score = score
+                best_capability_id = capability.capability_id
+
+        if best_score < 2.4:
+            return None
+        return best_capability_id or None
+
+    def _build_local_task_from_capability(
+        self,
+        *,
+        description: str,
+        normalized_description: str,
+        retry_note: str,
+        capability_id: str,
+        base_parameters: dict[str, str],
+    ) -> TaskSpec:
+        capability = get_capability(capability_id)
+        if capability is None:
+            return TaskSpec(
+                raw_description=description,
+                normalized_description=normalized_description,
+                capability_id=None,
+                parameters=base_parameters,
+                missing_parameters=[],
+                note="",
+                source="rule",
+                retry_note=retry_note,
+            )
+
+        parameters = dict(base_parameters)
+        missing_parameters: list[str] = []
+        for parameter in capability.required_parameters:
+            if not parameter.required:
+                continue
+            if str(parameters.get(parameter.name, "")).strip():
+                continue
+            missing_parameters.append(parameter.name)
+
+        if "file" in missing_parameters and not self._contains_reference_token(normalized_description):
+            return self._task_missing_file(description, normalized_description, capability_id, retry_note)
+
+        return TaskSpec(
+            raw_description=description,
+            normalized_description=normalized_description,
+            capability_id=capability_id,
+            parameters=parameters,
+            missing_parameters=missing_parameters,
+            note="",
+            source="rule",
+            retry_note=retry_note,
+        )
 
     @staticmethod
     def _load_json_object(raw_response: str) -> dict[str, Any] | None:
@@ -214,6 +325,16 @@ class TaskInterpreter:
         if file_candidate:
             normalized = Path(file_candidate).expanduser()
             parameters["file"] = str(normalized)
+
+        matched_capability = self._match_capability_from_description(normalized_description)
+        if matched_capability:
+            return self._build_local_task_from_capability(
+                description=description,
+                normalized_description=normalized_description,
+                retry_note=retry_note,
+                capability_id=matched_capability,
+                base_parameters=parameters,
+            )
 
         return TaskSpec(
             raw_description=description,

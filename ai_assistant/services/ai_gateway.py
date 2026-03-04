@@ -9,10 +9,23 @@ from ai_assistant.services.ai_client import AIClient
 class AIGateway:
     def __init__(self, ai_client: AIClient | None = None) -> None:
         self.ai_client = ai_client or AIClient()
+        self._preferred_profile_id = ""
+
+    @staticmethod
+    def _unique_order(items: list[str]) -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for item in items:
+            token = str(item or "")
+            if token in seen:
+                continue
+            seen.add(token)
+            ordered.append(token)
+        return ordered
 
     def _profile_attempt_order(self, allow_fallback: bool, fallback_profiles: list[str] | None = None) -> list[str]:
         if fallback_profiles:
-            return [item for item in fallback_profiles if item]
+            return self._unique_order([item for item in fallback_profiles if item])
 
         config_service = getattr(self.ai_client, "config_service", None)
         if config_service is None:
@@ -26,7 +39,10 @@ class AIGateway:
         for profile_id in config_service.list_profile_ids():
             if profile_id != active_profile:
                 ordered.append(profile_id)
-        return ordered
+        preferred = str(self._preferred_profile_id or "")
+        if preferred and preferred in ordered:
+            ordered = [preferred, *[item for item in ordered if item != preferred]]
+        return self._unique_order(ordered)
 
     @staticmethod
     def _emit_attempt_event(callback: callable | None, payload: dict[str, Any]) -> None:
@@ -86,10 +102,12 @@ class AIGateway:
                     "ok": bool(ok and text),
                     "error_code": "",
                     "content_preview": text[:240],
+                    "error_preview": "",
                 }
 
                 if not ok:
                     attempt["error_code"] = "request_failed"
+                    attempt["error_preview"] = str(content or "").strip()[:180]
                     attempts.append(attempt)
                     last_error_text = content
                     last_error_code = "request_failed"
@@ -107,6 +125,7 @@ class AIGateway:
                     continue
                 if not text:
                     attempt["error_code"] = "empty_content"
+                    attempt["error_preview"] = "API 返回空内容"
                     attempts.append(attempt)
                     last_error_text = "❌ API 返回空内容"
                     last_error_code = "empty_content"
@@ -131,6 +150,8 @@ class AIGateway:
                     attempts=attempts,
                     used_profile=profile_id,
                 )
+                if profile_id:
+                    self._preferred_profile_id = profile_id
                 return response_envelope
 
             response_envelope = AIResponseEnvelope(

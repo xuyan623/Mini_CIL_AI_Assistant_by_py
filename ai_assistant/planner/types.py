@@ -60,6 +60,22 @@ class PlanDecision:
 
 
 @dataclass
+class ExecutionFacts:
+    resolved_files: dict[str, str] = field(default_factory=dict)
+    file_exists_ok: set[str] = field(default_factory=set)
+    file_line_count: dict[str, int] = field(default_factory=dict)
+    file_version_token: dict[str, int] = field(default_factory=dict)
+    last_mutation_step: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class StepRewriteResult:
+    command: str
+    rewritten: bool = False
+    reason: str = ""
+
+
+@dataclass
 class ShellExecutionResult:
     command: str
     exit_code: int

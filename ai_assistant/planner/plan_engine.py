@@ -6,7 +6,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from ai_assistant.planner.types import PlanDecision, PlanStep, TaskSpec, WorkflowState
+from ai_assistant.planner.types import ExecutionFacts, PlanDecision, PlanStep, StepRewriteResult, TaskSpec, WorkflowState
 
 
 class PlanEngine:
@@ -163,6 +163,171 @@ class PlanEngine:
         if candidate.exists() and candidate.is_file():
             return str(candidate)
         return ""
+
+    @staticmethod
+    def _normalize_path_token(path_text: str) -> str:
+        candidate = str(path_text or "").strip().strip("\"' ")
+        if not candidate:
+            return ""
+        if re.match(r"^[A-Za-z]:\\", candidate):
+            return candidate
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        else:
+            path = path.resolve()
+        return str(path)
+
+    @staticmethod
+    def _first_int_from_output(output_text: str) -> int | None:
+        match = re.search(r"(-?\d+)", str(output_text or ""))
+        if not match:
+            return None
+        try:
+            value = int(match.group(1))
+        except Exception:
+            return None
+        return value if value >= 0 else None
+
+    @staticmethod
+    def _extract_file_from_wc_command(command: str) -> str:
+        match = re.search(r"wc\s+-l\s*<\s*([^\s;\)]+)", command)
+        if not match:
+            return ""
+        return str(match.group(1)).strip().strip("\"'")
+
+    @staticmethod
+    def _extract_file_from_testf_command(command: str) -> str:
+        match = re.search(r"^\s*test\s+-f\s+(.+)$", command)
+        if not match:
+            return ""
+        return str(match.group(1)).strip().strip("\"'")
+
+    @staticmethod
+    def _extract_name_from_find_command(command: str) -> str:
+        match = re.search(r"-name\s+([^\s]+)", command)
+        if not match:
+            return ""
+        return str(match.group(1)).strip().strip("\"'")
+
+    def extract_execution_facts(self, transcript: list[dict[str, Any]], task: TaskSpec) -> ExecutionFacts:
+        facts = ExecutionFacts()
+        target_file = str(task.parameters.get("file", "")).strip()
+        if target_file:
+            normalized_target = self._normalize_path_token(target_file)
+            if normalized_target:
+                facts.resolved_files["target"] = normalized_target
+                facts.resolved_files[Path(normalized_target).name] = normalized_target
+
+        for index, record in enumerate(transcript, 1):
+            command = str(record.get("command", "")).strip()
+            exit_code = int(record.get("exit_code", 0))
+            stdout_text = str(record.get("stdout", ""))
+            if not command:
+                continue
+
+            test_file = self._extract_file_from_testf_command(command)
+            if test_file and exit_code == 0:
+                normalized_test_file = self._normalize_path_token(test_file)
+                if normalized_test_file:
+                    facts.file_exists_ok.add(normalized_test_file)
+                    facts.resolved_files.setdefault(Path(normalized_test_file).name, normalized_test_file)
+
+            if "find " in command and "-name" in command and exit_code == 0:
+                find_matches = self._extract_find_matches(stdout_text)
+                if len(find_matches) == 1:
+                    normalized_match = self._normalize_path_token(find_matches[0])
+                    if normalized_match:
+                        facts.file_exists_ok.add(normalized_match)
+                        facts.resolved_files["target"] = normalized_match
+                        facts.resolved_files[Path(normalized_match).name] = normalized_match
+
+            wc_file = self._extract_file_from_wc_command(command)
+            if wc_file and exit_code == 0:
+                line_count = self._first_int_from_output(stdout_text)
+                if line_count is not None:
+                    normalized_wc_file = self._normalize_path_token(wc_file)
+                    if normalized_wc_file:
+                        facts.file_line_count[normalized_wc_file] = max(line_count, 1)
+
+            write_match = re.search(r"\bai\s+code\s+(comment|optimize|generate)\s+([^\s]+)", command)
+            if write_match and exit_code == 0:
+                write_file = str(write_match.group(2)).strip().strip("\"'")
+                normalized_write_file = self._normalize_path_token(write_file)
+                if normalized_write_file:
+                    next_version = int(facts.file_version_token.get(normalized_write_file, 0)) + 1
+                    facts.file_version_token[normalized_write_file] = next_version
+                    facts.last_mutation_step[normalized_write_file] = index
+                    facts.file_line_count.pop(normalized_write_file, None)
+                    facts.file_exists_ok.add(normalized_write_file)
+                    facts.resolved_files["target"] = normalized_write_file
+                    facts.resolved_files[Path(normalized_write_file).name] = normalized_write_file
+
+        return facts
+
+    @staticmethod
+    def _replace_end_expression(command: str, raw_file: str, line_count: int) -> str:
+        replacements = [
+            (
+                rf'"?\$\(lines=\$\(wc -l < {re.escape(raw_file)}\); '
+                rf'\[ "\$lines" -gt 0 \] && echo "\$lines" \|\| echo 1\)"?'
+            ),
+            rf'"?\$\(wc -l < {re.escape(raw_file)}\)"?',
+        ]
+        rewritten = command
+        for pattern in replacements:
+            rewritten = re.sub(pattern, str(line_count), rewritten)
+        return rewritten
+
+    def rewrite_command_with_facts(self, command: str, facts: ExecutionFacts, task: TaskSpec) -> StepRewriteResult:
+        if "wc -l <" not in command or "--end" not in command:
+            return StepRewriteResult(command=command, rewritten=False, reason="")
+
+        raw_file = self._extract_file_from_wc_command(command)
+        if not raw_file:
+            return StepRewriteResult(command=command, rewritten=False, reason="")
+
+        normalized_file = self._normalize_path_token(raw_file)
+        line_count = facts.file_line_count.get(normalized_file)
+        if line_count is None:
+            fallback_file = self._normalize_path_token(str(task.parameters.get("file", "")))
+            if fallback_file and fallback_file == normalized_file:
+                line_count = facts.file_line_count.get(fallback_file)
+        if line_count is None:
+            return StepRewriteResult(command=command, rewritten=False, reason="")
+
+        rewritten_command = self._replace_end_expression(command, raw_file, line_count)
+        if rewritten_command == command:
+            return StepRewriteResult(command=command, rewritten=False, reason="")
+        return StepRewriteResult(
+            command=rewritten_command,
+            rewritten=True,
+            reason=f"已复用上一步行数: {line_count}",
+        )
+
+    def should_skip_redundant_step(self, command: str, facts: ExecutionFacts, task: TaskSpec) -> tuple[bool, str]:
+        normalized_command = self._normalize_command(command)
+
+        test_file = self._extract_file_from_testf_command(normalized_command)
+        if test_file:
+            normalized_test_file = self._normalize_path_token(test_file)
+            if normalized_test_file and normalized_test_file in facts.file_exists_ok:
+                return True, f"目标文件已确认存在：{normalized_test_file}"
+            return False, ""
+
+        if normalized_command.startswith("find ") and " -type f " in f" {normalized_command} " and " -name " in f" {normalized_command} ":
+            find_name = self._extract_name_from_find_command(normalized_command)
+            if not find_name:
+                return False, ""
+            normalized_target_file = self._normalize_path_token(str(task.parameters.get("file", "")))
+            if normalized_target_file and Path(normalized_target_file).name == find_name and normalized_target_file in facts.file_exists_ok:
+                return True, f"目标路径已确定：{normalized_target_file}"
+            same_name_candidates = [item for item in facts.file_exists_ok if Path(item).name == find_name]
+            if len(same_name_candidates) == 1:
+                return True, f"已存在唯一候选路径：{same_name_candidates[0]}"
+            return False, ""
+
+        return False, ""
 
     def _resolve_single_file(self, target_file: str) -> tuple[str | None, str]:
         matches = self._find_file_matches(target_file)
@@ -373,4 +538,3 @@ class PlanEngine:
         if not valid:
             return PlanDecision(action="abort", message=validation_message)
         return PlanDecision(action="next", command=raw_next, message="")
-

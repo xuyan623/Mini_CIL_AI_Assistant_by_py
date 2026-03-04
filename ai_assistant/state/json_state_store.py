@@ -69,6 +69,19 @@ class JsonStateStore:
             self._transaction.read_cache[path_key] = deepcopy(next_payload)
             return deepcopy(next_payload)
 
+    def set_json(
+        self,
+        path: Path,
+        payload: Any,
+        normalizer: Normalizer | None = None,
+    ) -> Any:
+        with self._mutex:
+            next_payload = payload if normalizer is None else normalizer(payload)
+            path_key = str(path.resolve())
+            self._transaction.dirty_payloads[path_key] = deepcopy(next_payload)
+            self._transaction.read_cache[path_key] = deepcopy(next_payload)
+            return deepcopy(next_payload)
+
     def flush(self) -> int:
         with self._mutex:
             write_count = 0

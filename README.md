@@ -166,6 +166,11 @@ python ai.py shell run "./mycode 目录里没有 AI 就创建"
 6. 模型输出非 JSON 时会自动修复一次；修复失败则中止。
 7. 非交互终端只生成步骤，不执行。
 8. `Ctrl+C` 优雅中断，退出码 `130`。
+9. 若上一步已得到行数（如 `wc -l`），后续 `ai code ... --end` 会优先复用该数字。
+10. 若目标文件被写入（`ai code comment/optimize/generate`），行数缓存自动失效并重算。
+11. 纯探测冗余步骤会自动跳过（如重复 `test -f`、已唯一定位后的重复 `find`）。
+12. 同一 shell trace 内会优先复用最近成功的模型配置，减少重复 fallback。
+13. 规划失败时会输出 profile 级失败摘要（含 `error_preview`）。
 
 附加约束：
 
@@ -178,7 +183,7 @@ python ai.py shell run "./mycode 目录里没有 AI 就创建"
 运行时文件固定在 `root` 下：
 
 1. `assistant-config/profiles.json`：模型配置
-2. `assistant-state/history.json`：历史（`messages/events/planner_traces/resolution_traces/entities`）
+2. `assistant-state/history.json`：历史（`messages/events/planner_traces/entities`）
 3. `assistant-state/context.json`：代码上下文
 4. `assistant-data/backup_index.json`：备份索引
 5. `assistant-data/backups/`：备份文件
@@ -204,8 +209,8 @@ python -m pytest \
 
 当前仓库状态（2026-03-04）：
 
-1. `151 passed`
-2. 总覆盖率 `94.16%`
+1. `python -m pytest -q` 可通过
+2. 覆盖率门禁 `--cov-fail-under=90` 已启用并可通过
 
 ## 9. 常见问题
 

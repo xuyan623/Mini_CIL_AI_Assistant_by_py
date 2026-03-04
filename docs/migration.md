@@ -11,13 +11,16 @@ This document tracks storage/protocol and internal architecture changes introduc
     - `messages`
     - `events`
     - `planner_traces`
-    - `resolution_traces`
     - `entities`
 - Event metadata standardized with:
   - `ui_block_id`
   - `display_level`
   - `decision_source`
   - `io_stats`
+  - `rewrite_reason`
+  - `skipped`
+  - `skip_reason`
+  - `profile_order_used`
 - State persistence unified through `JsonStateStore`.
   - integrated in `HistoryService`, `ConfigService`, `ContextService`
   - transaction-style flush support
@@ -37,6 +40,11 @@ This document tracks storage/protocol and internal architecture changes introduc
   - `shell/execution_runtime.py`
   - `shell/event_recorder.py`
   - `services/shell_service.py` kept as facade + integration point
+- Shell iteration enhancements:
+  - execution facts extraction (`line count / exists / mutation`)
+  - command rewrite before execution (line-count reuse)
+  - redundant probe step skip
+  - trace-level model routing order reuse
 - UI split:
   - `ui/view_models.py`
   - `ui/output_renderer.py`

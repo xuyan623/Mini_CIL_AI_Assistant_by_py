@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import re
 import uuid
@@ -27,6 +27,13 @@ class HistorySettings:
     max_events: int | None = None
     max_planner_traces: int | None = None
     max_entities: int = 2000
+
+
+@dataclass
+class HistoryBatch:
+    payload: dict[str, Any]
+    dirty: bool = False
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class HistoryService:
@@ -183,13 +190,21 @@ class HistoryService:
 
     def save_payload(self, payload: dict[str, Any]) -> None:
         normalized_payload = self._normalize_payload(payload)
-        self.state_store.update_json(
+        self.state_store.set_json(
             self.path_manager.history_path,
-            updater=lambda _current: normalized_payload,
-            default_factory=self._default_payload,
+            normalized_payload,
             normalizer=self._normalize_payload,
         )
         self.state_store.flush()
+
+    def begin_batch(self) -> HistoryBatch:
+        return HistoryBatch(payload=self.load_payload(), dirty=False)
+
+    def commit_batch(self, batch: HistoryBatch) -> None:
+        if not batch.dirty:
+            return
+        self.save_payload(batch.payload)
+        batch.dirty = False
 
     def clear(self) -> None:
         self.save_payload(self._default_payload())
@@ -233,7 +248,30 @@ class HistoryService:
         exit_code: int,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        payload = self.load_payload()
+        batch = self.begin_batch()
+        self.append_event_in_batch(
+            batch=batch,
+            event_type=event_type,
+            input_text=input_text,
+            output_text=output_text,
+            ok=ok,
+            exit_code=exit_code,
+            metadata=metadata,
+        )
+        self.commit_batch(batch)
+
+    def append_event_in_batch(
+        self,
+        *,
+        batch: HistoryBatch,
+        event_type: str,
+        input_text: str,
+        output_text: str,
+        ok: bool,
+        exit_code: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        payload = batch.payload
         metadata_dict = dict(metadata) if isinstance(metadata, dict) else {}
         metadata_dict.setdefault("ui_block_id", "")
         metadata_dict.setdefault("display_level", "")
@@ -267,7 +305,8 @@ class HistoryService:
         events.append(event)
         if self.settings.max_events is not None and len(events) > self.settings.max_events:
             payload["events"] = events[-self.settings.max_events :]
-        self.save_payload(payload)
+        batch.dirty = True
+        return event_id
 
     def append_planner_trace(
         self,
@@ -282,7 +321,36 @@ class HistoryService:
         attempts: list[dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        payload = self.load_payload()
+        batch = self.begin_batch()
+        self.append_planner_trace_in_batch(
+            batch=batch,
+            trace_id=trace_id,
+            stage=stage,
+            request=request,
+            response=response,
+            ok=ok,
+            error_code=error_code,
+            used_profile=used_profile,
+            attempts=attempts,
+            metadata=metadata,
+        )
+        self.commit_batch(batch)
+
+    def append_planner_trace_in_batch(
+        self,
+        *,
+        batch: HistoryBatch,
+        trace_id: str,
+        stage: str,
+        request: str,
+        response: str,
+        ok: bool,
+        error_code: str = "",
+        used_profile: str = "",
+        attempts: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        payload = batch.payload
         traces = payload.setdefault("planner_traces", [])
         traces.append(
             {
@@ -300,7 +368,7 @@ class HistoryService:
         )
         if self.settings.max_planner_traces is not None and len(traces) > self.settings.max_planner_traces:
             payload["planner_traces"] = traces[-self.settings.max_planner_traces :]
-        self.save_payload(payload)
+        batch.dirty = True
 
     def append_resolution_trace(
         self,
@@ -312,7 +380,9 @@ class HistoryService:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         metadata_dict = metadata if isinstance(metadata, dict) else {}
-        self.append_planner_trace(
+        batch = self.begin_batch()
+        self.append_planner_trace_in_batch(
+            batch=batch,
             trace_id=trace_id,
             stage="reference_resolution",
             request=request,
@@ -323,7 +393,8 @@ class HistoryService:
             attempts=[],
             metadata=metadata_dict,
         )
-        self.append_event(
+        self.append_event_in_batch(
+            batch=batch,
             event_type="resolution",
             input_text=request,
             output_text=response,
@@ -340,6 +411,7 @@ class HistoryService:
                 **metadata_dict,
             },
         )
+        self.commit_batch(batch)
 
     def append_entity(
         self,
@@ -353,7 +425,35 @@ class HistoryService:
         platform: str = "alpine",
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        payload = self.load_payload()
+        batch = self.begin_batch()
+        entity = self.append_entity_in_batch(
+            batch=batch,
+            entity_type=entity_type,
+            value=value,
+            normalized_value=normalized_value,
+            source_event_id=source_event_id,
+            trace_id=trace_id,
+            confidence=confidence,
+            platform=platform,
+            metadata=metadata,
+        )
+        self.commit_batch(batch)
+        return entity
+
+    def append_entity_in_batch(
+        self,
+        *,
+        batch: HistoryBatch,
+        entity_type: str,
+        value: str,
+        normalized_value: str | None = None,
+        source_event_id: str = "",
+        trace_id: str = "",
+        confidence: float = 1.0,
+        platform: str = "alpine",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = batch.payload
         entity = {
             "entity_id": uuid.uuid4().hex,
             "entity_type": str(entity_type),
@@ -370,7 +470,7 @@ class HistoryService:
         entities.append(entity)
         if len(entities) > self.settings.max_entities:
             payload["entities"] = entities[-self.settings.max_entities :]
-        self.save_payload(payload)
+        batch.dirty = True
         return entity
 
     def find_entities(
