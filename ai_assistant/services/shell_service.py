@@ -13,12 +13,19 @@ from ai_assistant.planner.plan_engine import PlanEngine
 from ai_assistant.planner.step_executor import StepExecutor
 from ai_assistant.planner.task_interpreter import TaskInterpreter
 from ai_assistant.planner.types import AIResponseEnvelope, EntityRecord, PlanDecision, ReferenceResolutionResult, TaskSpec
+from ai_assistant.shell import (
+    ShellEventRecorder,
+    ShellExecutionRuntime,
+    ShellOrchestrator,
+    ShellPlannerAdapter,
+    ShellReferenceResolution,
+)
 from ai_assistant.services.ai_client import AIClient
 from ai_assistant.services.ai_gateway import AIGateway
 from ai_assistant.services.context_service import ContextService
 from ai_assistant.services.history_service import HistoryService
 from ai_assistant.services.reference_resolver import ReferenceResolver
-from ai_assistant.ui import RuntimeFeedback
+from ai_assistant.ui import OutputRenderer, RuntimeFeedback
 
 
 @dataclass
@@ -44,6 +51,12 @@ class ShellService:
         self.step_timeout_seconds = 30
         self.plan_engine = PlanEngine(step_timeout_seconds=self.step_timeout_seconds)
         self.step_executor = StepExecutor(timeout_seconds=self.step_timeout_seconds)
+        self.output_renderer = OutputRenderer()
+        self.orchestrator = ShellOrchestrator(self)
+        self.planner_adapter = ShellPlannerAdapter(self)
+        self.reference_resolution = ShellReferenceResolution(self)
+        self.execution_runtime = ShellExecutionRuntime(self.output_renderer)
+        self.event_recorder = ShellEventRecorder(self)
         self._active_trace_context: dict[str, Any] | None = None
         self.dangerous_patterns: list[tuple[re.Pattern[str], str]] = [
             (re.compile(r"\brm\s+-rf\s+/\b"), "会删除整个系统"),
@@ -670,7 +683,7 @@ class ShellService:
         if base_task.capability_id == "__invalid__" or base_task.note.startswith("❌"):
             return False, base_task, [], base_task.note
 
-        resolved_ok, resolved_task, resolved_message = self._resolve_references(base_task, trace_id)
+        resolved_ok, resolved_task, resolved_message = self.reference_resolution.resolve(base_task, trace_id)
         if not resolved_ok:
             return False, resolved_task, [], resolved_message
         base_task = resolved_task
@@ -917,22 +930,19 @@ class ShellService:
                     metadata={"source": "ai file find"},
                 )
 
-    def run(self, description: str) -> tuple[bool, str]:
+    def _run_workflow(self, description: str) -> tuple[bool, str]:
         trace_id = uuid.uuid4().hex
-        ok, task, initial_steps, note = self._plan_from_description(description, trace_id)
+        ok, task, initial_steps, note = self.planner_adapter.plan_from_description(description, trace_id)
         if not ok:
             return False, note
         if not initial_steps:
             return False, "❌ 未生成有效步骤"
 
-        plan_lines = ["📋 生成步骤："]
-        if task.retry_note:
-            plan_lines.append(f"  📌 {task.retry_note}")
-        if note:
-            plan_lines.append(f"  📌 {note}")
-        for step in initial_steps:
-            plan_lines.append(f"  $ {step}")
-        plan_text = "\n".join(plan_lines)
+        plan_text = self.execution_runtime.render_plan(
+            retry_note=task.retry_note,
+            note=note,
+            steps=initial_steps,
+        )
 
         self._record_event(
             event_type="shell_plan",
@@ -1000,10 +1010,10 @@ class ShellService:
 
                 step_index += 1
                 report = self.safety_check(resolved_command)
-                step_lines = [f"\n🔹 第 {step_index} 步", f"  $ {resolved_command}"]
+                step_lines = [self.execution_runtime.render_step_intro(step_index, resolved_command, bool(report.warnings))]
                 if report.warnings:
-                    step_lines.append("  ⚠️ 安全警告：")
-                    step_lines.extend([f"    - {item}" for item in report.warnings])
+                    step_lines.append("[WARN] 安全警告：")
+                    step_lines.extend([f"  - {item}" for item in report.warnings])
                 self._emit_runtime_output("\n".join(step_lines))
 
                 confirm_prompt = (
@@ -1041,14 +1051,15 @@ class ShellService:
                     return True, f"✅ 第 {step_index} 步已取消，流程停止"
 
                 step_result = self.step_executor.execute(resolved_command)
-                step_result_lines = [f"  🧾 退出码：{step_result.exit_code}"]
-                if step_result.stdout:
-                    step_result_lines.append("  📤 标准输出：")
-                    step_result_lines.append(step_result.stdout.rstrip())
-                if step_result.stderr:
-                    step_result_lines.append("  ⚠️ 标准错误：")
-                    step_result_lines.append(step_result.stderr.rstrip())
-                self._emit_runtime_output("\n".join(step_result_lines))
+                self._emit_runtime_output(
+                    self.execution_runtime.render_step_result(
+                        step_index=step_index,
+                        command=resolved_command,
+                        exit_code=step_result.exit_code,
+                        stdout_text=step_result.stdout.rstrip(),
+                        stderr_text=step_result.stderr.rstrip(),
+                    )
+                )
 
                 event_output = (
                     f"exit_code={step_result.exit_code}\n"
@@ -1096,7 +1107,7 @@ class ShellService:
                     if workflow_decision is not None:
                         decision = workflow_decision
                     else:
-                        ai_ok, ai_decision = self._plan_next_with_ai(
+                        ai_ok, ai_decision = self.planner_adapter.plan_next(
                             task.normalized_description, transcript, suggested_steps, trace_id
                         )
                         if ai_ok:
@@ -1121,7 +1132,7 @@ class ShellService:
                     return False, f"❌ {message}"
 
                 if decision.message:
-                    self._emit_runtime_output(f"  📌 {decision.message}")
+                    self._emit_runtime_output(f"[INFO] {decision.message}")
 
                 next_command = decision.command.strip()
                 if not next_command:
@@ -1151,3 +1162,6 @@ class ShellService:
             raise
         finally:
             self._active_trace_context = None
+
+    def run(self, description: str) -> tuple[bool, str]:
+        return self.orchestrator.run(description)

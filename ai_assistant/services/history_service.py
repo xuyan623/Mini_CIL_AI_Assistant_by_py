@@ -6,8 +6,8 @@ import re
 import uuid
 from typing import Any
 
-from ai_assistant.storage import atomic_write_json, file_lock, safe_load_json
 from ai_assistant.paths import PathManager, get_path_manager
+from ai_assistant.state import JsonStateStore
 
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -30,19 +30,69 @@ class HistorySettings:
 
 
 class HistoryService:
-    def __init__(self, path_manager: PathManager | None = None, settings: HistorySettings | None = None) -> None:
+    def __init__(
+        self,
+        path_manager: PathManager | None = None,
+        settings: HistorySettings | None = None,
+        state_store: JsonStateStore | None = None,
+    ) -> None:
         self.path_manager = path_manager or get_path_manager()
         self.settings = settings or HistorySettings()
-        self.lock_path = self.path_manager.state_dir / "history.lock"
+        self.state_store = state_store or JsonStateStore()
 
     def _default_payload(self) -> dict[str, Any]:
         return {
-            "version": 5,
+            "version": 6,
             "messages": [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}],
             "events": [],
             "planner_traces": [],
             "entities": [],
         }
+
+    def _normalize_payload(self, raw_payload: Any) -> dict[str, Any]:
+        payload = raw_payload
+        if isinstance(payload, list):
+            payload = {"version": 1, "messages": payload}
+        if not isinstance(payload, dict):
+            payload = self._default_payload()
+
+        payload["version"] = 6
+        payload.setdefault("messages", [])
+        payload.setdefault("events", [])
+        payload.setdefault("planner_traces", [])
+        payload.setdefault("entities", [])
+        if not isinstance(payload["messages"], list):
+            payload["messages"] = []
+        if not isinstance(payload["events"], list):
+            payload["events"] = []
+        if not isinstance(payload["planner_traces"], list):
+            payload["planner_traces"] = []
+        if not isinstance(payload["entities"], list):
+            payload["entities"] = []
+        if not payload["messages"]:
+            payload["messages"] = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
+
+        normalized_events: list[dict[str, Any]] = []
+        for raw_event in payload["events"]:
+            normalized_event = self._normalize_event(raw_event)
+            if normalized_event is not None:
+                normalized_events.append(normalized_event)
+        payload["events"] = normalized_events
+
+        normalized_traces: list[dict[str, Any]] = []
+        for raw_trace in payload["planner_traces"]:
+            normalized_trace = self._normalize_planner_trace(raw_trace)
+            if normalized_trace is not None:
+                normalized_traces.append(normalized_trace)
+        payload["planner_traces"] = normalized_traces
+
+        normalized_entities: list[dict[str, Any]] = []
+        for raw_entity in payload["entities"]:
+            normalized_entity = self._normalize_entity(raw_entity)
+            if normalized_entity is not None:
+                normalized_entities.append(normalized_entity)
+        payload["entities"] = normalized_entities
+        return payload
 
     @staticmethod
     def _normalize_event(raw_event: Any) -> dict[str, Any] | None:
@@ -52,6 +102,11 @@ class HistoryService:
         metadata = raw_event.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
+        metadata = dict(metadata)
+        metadata.setdefault("ui_block_id", "")
+        metadata.setdefault("display_level", "")
+        metadata.setdefault("decision_source", "")
+        metadata.setdefault("io_stats", {})
 
         event_id = str(raw_event.get("event_id") or uuid.uuid4().hex)
         trace_id = str(raw_event.get("trace_id") or metadata.get("trace_id") or event_id)
@@ -120,58 +175,21 @@ class HistoryService:
         }
 
     def load_payload(self) -> dict[str, Any]:
-        with file_lock(self.lock_path):
-            payload = safe_load_json(self.path_manager.history_path, self._default_payload())
-            if isinstance(payload, list):
-                payload = {"version": 1, "messages": payload}
-            if not isinstance(payload, dict):
-                payload = self._default_payload()
-            payload_version = int(payload.get("version", 1) or 1)
-            payload["version"] = 5
-            payload.setdefault("messages", [])
-            payload.setdefault("events", [])
-            payload.setdefault("planner_traces", [])
-            payload.setdefault("entities", [])
-            if not isinstance(payload["messages"], list):
-                payload["messages"] = []
-            if not isinstance(payload["events"], list):
-                payload["events"] = []
-            if not isinstance(payload["planner_traces"], list):
-                payload["planner_traces"] = []
-            if not isinstance(payload["entities"], list):
-                payload["entities"] = []
-            if not payload["messages"]:
-                payload["messages"] = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
-
-            normalized_events: list[dict[str, Any]] = []
-            for raw_event in payload["events"]:
-                normalized_event = self._normalize_event(raw_event)
-                if normalized_event is not None:
-                    normalized_events.append(normalized_event)
-            payload["events"] = normalized_events
-
-            normalized_traces: list[dict[str, Any]] = []
-            for raw_trace in payload["planner_traces"]:
-                normalized_trace = self._normalize_planner_trace(raw_trace)
-                if normalized_trace is not None:
-                    normalized_traces.append(normalized_trace)
-            payload["planner_traces"] = normalized_traces
-
-            normalized_entities: list[dict[str, Any]] = []
-            for raw_entity in payload["entities"]:
-                normalized_entity = self._normalize_entity(raw_entity)
-                if normalized_entity is not None:
-                    normalized_entities.append(normalized_entity)
-            payload["entities"] = normalized_entities
-
-            if payload_version < 5:
-                payload["version"] = 5
-            atomic_write_json(self.path_manager.history_path, payload)
-            return payload
+        return self.state_store.read_json(
+            self.path_manager.history_path,
+            default_factory=self._default_payload,
+            normalizer=self._normalize_payload,
+        )
 
     def save_payload(self, payload: dict[str, Any]) -> None:
-        with file_lock(self.lock_path):
-            atomic_write_json(self.path_manager.history_path, payload)
+        normalized_payload = self._normalize_payload(payload)
+        self.state_store.update_json(
+            self.path_manager.history_path,
+            updater=lambda _current: normalized_payload,
+            default_factory=self._default_payload,
+            normalizer=self._normalize_payload,
+        )
+        self.state_store.flush()
 
     def clear(self) -> None:
         self.save_payload(self._default_payload())
@@ -216,7 +234,11 @@ class HistoryService:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         payload = self.load_payload()
-        metadata_dict = metadata if isinstance(metadata, dict) else {}
+        metadata_dict = dict(metadata) if isinstance(metadata, dict) else {}
+        metadata_dict.setdefault("ui_block_id", "")
+        metadata_dict.setdefault("display_level", "")
+        metadata_dict.setdefault("decision_source", "")
+        metadata_dict.setdefault("io_stats", self.state_store.get_io_stats())
         event_id = str(metadata_dict.get("event_id") or uuid.uuid4().hex)
         trace_id = str(metadata_dict.get("trace_id") or event_id)
         module = str(metadata_dict.get("module", ""))

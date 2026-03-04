@@ -21,3 +21,9 @@ assistant-data/
 .env
 .env.*
 *.log
+
+# 测试与分析产物
+.coverage
+.coverage.*
+cov_annotate/
+.tmp_profile.prof

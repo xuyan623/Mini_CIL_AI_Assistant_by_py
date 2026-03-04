@@ -2,9 +2,6 @@ from __future__ import annotations
 
 from ai_assistant.cli_runtime import (
     AppContext,
-    _build_parser,
-    _dispatch,
-    _format_command_line,
     _handle_backup,
     _handle_code,
     _handle_config,
@@ -12,33 +9,18 @@ from ai_assistant.cli_runtime import (
     _handle_file,
     _handle_shell,
     _migration_message,
-    _parse_on_off,
     _result_from_message,
-    argparse,
-    main,
-    run,
 )
 
 __all__ = [
     "AppContext",
-    "_parse_on_off",
-    "_build_parser",
     "_result_from_message",
+    "_migration_message",
     "_handle_file",
     "_handle_code",
     "_handle_context",
     "_handle_backup",
     "_handle_config",
     "_handle_shell",
-    "_migration_message",
-    "_format_command_line",
-    "_dispatch",
-    "run",
-    "main",
-    "argparse",
 ]
-
-
-if __name__ == "__main__":
-    main()
 

@@ -4,27 +4,53 @@ from pathlib import Path
 from typing import Any
 
 from ai_assistant.paths import PathManager, get_path_manager
-from ai_assistant.storage import atomic_write_json, safe_load_json
+from ai_assistant.state import JsonStateStore
 
 
 class ContextService:
-    def __init__(self, path_manager: PathManager | None = None) -> None:
+    def __init__(
+        self,
+        path_manager: PathManager | None = None,
+        state_store: JsonStateStore | None = None,
+    ) -> None:
         self.path_manager = path_manager or get_path_manager()
+        self.state_store = state_store or JsonStateStore()
 
     @staticmethod
     def _default_payload() -> dict[str, Any]:
         return {"version": 1, "files": []}
 
     def load_payload(self) -> dict[str, Any]:
-        payload = safe_load_json(self.path_manager.context_path, self._default_payload())
-        if not isinstance(payload, dict):
-            payload = self._default_payload()
-        payload.setdefault("version", 1)
-        payload.setdefault("files", [])
-        return payload
+        def normalizer(raw_payload: Any) -> dict[str, Any]:
+            payload = raw_payload if isinstance(raw_payload, dict) else self._default_payload()
+            payload.setdefault("version", 1)
+            payload.setdefault("files", [])
+            if not isinstance(payload.get("files"), list):
+                payload["files"] = []
+            return payload
+
+        return self.state_store.read_json(
+            self.path_manager.context_path,
+            default_factory=self._default_payload,
+            normalizer=normalizer,
+        )
 
     def save_payload(self, payload: dict[str, Any]) -> None:
-        atomic_write_json(self.path_manager.context_path, payload)
+        def normalizer(raw_payload: Any) -> dict[str, Any]:
+            candidate = raw_payload if isinstance(raw_payload, dict) else self._default_payload()
+            candidate.setdefault("version", 1)
+            candidate.setdefault("files", [])
+            if not isinstance(candidate.get("files"), list):
+                candidate["files"] = []
+            return candidate
+
+        self.state_store.update_json(
+            self.path_manager.context_path,
+            updater=lambda _current: normalizer(payload),
+            default_factory=self._default_payload,
+            normalizer=normalizer,
+        )
+        self.state_store.flush()
 
     @staticmethod
     def _read_file_content(file_path: Path, start_line: int | None, end_line: int | None) -> tuple[str, str]:

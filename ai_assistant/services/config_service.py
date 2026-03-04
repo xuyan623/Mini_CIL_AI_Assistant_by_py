@@ -8,16 +8,20 @@ from typing import Any
 
 from ai_assistant.models import ProfileConfig
 from ai_assistant.paths import get_path_manager, PathManager
-from ai_assistant.storage import atomic_write_json, file_lock, safe_load_json
+from ai_assistant.state import JsonStateStore
 
 
 class ConfigService:
     _warned_plaintext = False
 
-    def __init__(self, path_manager: PathManager | None = None) -> None:
+    def __init__(
+        self,
+        path_manager: PathManager | None = None,
+        state_store: JsonStateStore | None = None,
+    ) -> None:
         self.path_manager = path_manager or get_path_manager()
         self.path_manager.ensure_directories()
-        self.lock_path = self.path_manager.config_dir / "profiles.lock"
+        self.state_store = state_store or JsonStateStore()
 
     @staticmethod
     def _default_payload() -> dict[str, Any]:
@@ -71,18 +75,23 @@ class ConfigService:
         }
 
     def load_payload(self) -> dict[str, Any]:
-        with file_lock(self.lock_path):
-            payload = safe_load_json(self.path_manager.profiles_path, self._default_payload())
-            if not isinstance(payload, dict):
-                payload = self._default_payload()
-            payload = self._normalize_payload(payload)
-            atomic_write_json(self.path_manager.profiles_path, payload)
-            self._warn_if_plaintext(payload)
-            return payload
+        payload = self.state_store.read_json(
+            self.path_manager.profiles_path,
+            default_factory=self._default_payload,
+            normalizer=self._normalize_payload,
+        )
+        self._warn_if_plaintext(payload)
+        return payload
 
     def save_payload(self, payload: dict[str, Any]) -> None:
-        with file_lock(self.lock_path):
-            atomic_write_json(self.path_manager.profiles_path, payload)
+        normalized_payload = self._normalize_payload(payload)
+        self.state_store.update_json(
+            self.path_manager.profiles_path,
+            updater=lambda _current: normalized_payload,
+            default_factory=self._default_payload,
+            normalizer=self._normalize_payload,
+        )
+        self.state_store.flush()
 
     @staticmethod
     def _warn_if_plaintext(payload: dict[str, Any]) -> None:

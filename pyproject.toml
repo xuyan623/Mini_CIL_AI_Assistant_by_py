@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+addopts = "-q --cov=ai_assistant --cov-report=term-missing --cov-report=annotate:cov_annotate --cov-fail-under=90"
+testpaths = ["tests"]
+

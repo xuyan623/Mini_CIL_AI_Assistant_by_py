@@ -201,7 +201,9 @@ class CLITests(unittest.TestCase):
 
         import ai_assistant.cli as cli_module  # pylint: disable=import-outside-toplevel
 
-        with mock.patch.object(cli_module, "_dispatch", side_effect=KeyboardInterrupt):
+        import ai_assistant.cli_runtime as cli_runtime  # pylint: disable=import-outside-toplevel
+
+        with mock.patch.object(cli_runtime, "_dispatch", side_effect=KeyboardInterrupt):
             with mock.patch.object(sys, "argv", [str(AI_ENTRY), "chat", "hello"]):
                 code = cli_module.run(["chat", "hello"])
         self.assertEqual(code, 130)

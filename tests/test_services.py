@@ -138,7 +138,7 @@ class HistoryServiceTests(EnvMixin, unittest.TestCase):
         self.assertIn("messages", payload)
         self.assertGreater(len(payload["messages"]), 1)
 
-    def test_history_v2_payload_is_auto_migrated_to_v5(self) -> None:
+    def test_history_v2_payload_is_auto_migrated_to_v6(self) -> None:
         manager = PathManager(project_root=self.project_root)
         history_path = manager.history_path
         legacy_payload = {
@@ -160,7 +160,7 @@ class HistoryServiceTests(EnvMixin, unittest.TestCase):
 
         service = HistoryService(manager)
         migrated_payload = service.load_payload()
-        self.assertEqual(migrated_payload.get("version"), 5)
+        self.assertEqual(migrated_payload.get("version"), 6)
         self.assertTrue(migrated_payload.get("events"))
         self.assertIn("planner_traces", migrated_payload)
         self.assertIn("entities", migrated_payload)

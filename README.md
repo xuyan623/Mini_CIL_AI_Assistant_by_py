@@ -1,49 +1,47 @@
-# AI Terminal Assistant (v2)
+# AI Terminal Assistant (Alpine-first)
 
-面向 Alpine Linux 的命令行 AI 助手，支持：
+面向 Alpine Linux 的命令行 AI 助手，统一提供 `chat/file/code/context/backup/config/shell` 七类能力。
 
-1. 普通对话
-2. 文件与目录操作
-3. 代码检查/解释/优化/生成
-4. 代码上下文问答
-5. 备份管理
-6. 多模型配置切换
-7. Shell 命令生成与安全提示
+## 1. 项目定位
 
-## 1. 运行要求
+这个项目解决三个核心问题：
 
-1. Python 3.8+
-2. 推荐 Alpine Linux（其他 Linux/macOS/Windows 也可运行）
-3. 可访问模型 API 的网络环境
+1. 把自然语言转成可执行的终端工作流（`ai shell run`）。
+2. 把代码操作（检查/注释/优化/解释/生成）做成可追溯、可回滚流程。
+3. 把配置、上下文、历史、备份统一收敛到 `root` 内部状态目录。
 
-## 2. 3 分钟上手
+## 2. 运行环境
 
-### 第一步：进入目录并看帮助
+1. Python `3.8+`
+2. Alpine Linux 优先（Linux/macOS/Windows 也可运行）
+3. 可访问模型 API
+
+## 3. 60 秒上手
+
+在 `root` 目录执行：
 
 ```bash
 cd root
 python ai.py -h
 ```
 
-### 第二步：配置模型
-
-推荐方式（避免把 API Key 留在 shell 历史）：
+添加模型配置（二选一）：
 
 ```bash
+# 交互方式（推荐）
 python config.py --add
-```
 
-命令行方式（便于自动化）：
-
-```bash
-python ai.py config add --profile deepseek --name "DeepSeek" \
+# 命令行方式
+python ai.py config add \
+  --profile deepseek \
+  --name "DeepSeek" \
   --api-key "sk-xxx" \
   --api-url "https://api.deepseek.com/v1/chat/completions" \
   --model "deepseek-reasoner" \
   --stream off
 ```
 
-### 第三步：验证可用
+验证：
 
 ```bash
 python ai.py config current
@@ -51,43 +49,70 @@ python ai.py chat "你好"
 python ai.py file ls .
 ```
 
-## 3. 命令速查
+## 4. 命令总览
 
-### chat 普通对话
+主帮助：
 
 ```bash
-python ai.py chat "请解释一下这个项目是做什么的"
+python ai.py -h
+```
+
+配置帮助：
+
+```bash
+python ai.py config -h
+```
+
+七大模块：
+
+1. `chat`：普通对话
+2. `file`：文件与目录
+3. `code`：代码操作
+4. `context`：代码上下文
+5. `backup`：备份管理
+6. `config`：模型配置
+7. `shell`：自然语言分步执行
+
+## 5. 常用命令示例
+
+### 5.1 chat
+
+```bash
+python ai.py chat "请解释这个项目"
 python ai.py --clear
 ```
 
-### file 文件与目录
+### 5.2 file
 
 ```bash
 python ai.py file ls .
 python ai.py file read ./README.md
 python ai.py file search ./README.md "配置"
-python ai.py file find "config" --dir .
+python ai.py file find "Sam.c" --dir .
 python ai.py file rm ./tmp.txt --force
 python ai.py file rmdir ./tmp_dir --force
 ```
 
-### code 代码操作
+### 5.3 code
 
 ```bash
-python ai.py code check app.py --start 1 --end 80
-python ai.py code explain app.py --start 1 --end 80
-python ai.py code comment app.py --start 10 --end 40
-python ai.py code optimize app.py --start 10 --end 40
+python ai.py code check app.py --start 1 --end 120
+python ai.py code explain app.py --start 1 --end 120
+python ai.py code comment app.py --start 1 --end 120
+python ai.py code optimize app.py --start 1 --end 120
 python ai.py code generate app.py --start 1 --end 1 --desc "add argparse import"
 python ai.py code summarize app.py
+```
 
-# 非交互写入（适合 shell 分步自动执行）
-python ai.py code comment app.py --start 10 --end 40 --yes
-python ai.py code optimize app.py --start 10 --end 40 --yes
+写入类命令可加 `--yes` 跳过确认：
+
+```bash
+python ai.py code comment app.py --start 1 --end 120 --yes
+python ai.py code optimize app.py --start 1 --end 120 --yes
 python ai.py code generate app.py --start 1 --end 1 --desc "add argparse import" --yes
 ```
 
-### context 代码上下文
+### 5.4 context
 
 ```bash
 python ai.py context set app.py --start 1 --end 120
@@ -97,7 +122,7 @@ python ai.py context ask "app.py 如何调用 utils.py?"
 python ai.py context clear
 ```
 
-### backup 备份管理
+### 5.5 backup
 
 ```bash
 python ai.py backup create app.py --keep 5
@@ -108,7 +133,7 @@ python ai.py backup restore <backup-file> --target app.py
 python ai.py backup clean app.py --keep 3
 ```
 
-### config 配置管理
+### 5.6 config
 
 ```bash
 python ai.py config list
@@ -121,106 +146,87 @@ python ai.py config export deepseek ./deepseek.profile.json --redact
 python ai.py config import ./deepseek.profile.json --profile deepseek_copy
 ```
 
-### shell Shell 命令生成
+### 5.7 shell
 
 ```bash
-python ai.py shell run "查找大于 100M 的文件"
+python ai.py shell run "检查并修复 Sam.c"
+python ai.py shell run "先找 Sam.c，再备份这个文件"
+python ai.py shell run "./mycode 目录里没有 AI 就创建"
 ```
 
-运行流程：
+## 6. `shell run` 行为规则（重要）
 
-1. 先执行“指代解析”（如“这个文件/它”），若唯一命中则自动回填路径
-2. 信息不足时先生成可执行的发现步骤（如 `find`），不会展示占位符命令
-3. 再用模型生成首批结构化步骤（必须是 JSON 协议）
-4. 若模型输出非 JSON，会自动进行一次修复回合；修复失败则直接中止
-5. 询问是否开始执行（`y/n`）
-6. 每一步执行前再次确认（`y/n`）
-7. 每一步执行后立即输出结果并写入历史
-8. 下一步会基于上一步 `stdout/stderr/exit code` 重新规划，不是机械照抄草案
+`ai shell run` 不是一次性黑盒执行，而是“规划 + 确认 + 执行 + 再规划”的状态机：
 
-说明：
+1. 先做任务解释与指代解析（例如“这个文件”“它”）。
+2. 信息不足时先生成可执行发现步骤（例如 `find/test/sed/wc`）。
+3. 每一步都需要用户确认（`y/n`）。
+4. 每一步执行后立刻展示 `exit_code/stdout/stderr`。
+5. 下一步会基于上一步结果动态生成，而不是机械照抄草稿。
+6. 模型输出非 JSON 时会自动修复一次；修复失败则中止。
+7. 非交互终端只生成步骤，不执行。
+8. `Ctrl+C` 优雅中断，退出码 `130`。
 
-1. 指代歧义时（候选 >1）会停止并要求你明确路径，不会盲猜执行
-2. 在 Alpine 环境下，Windows 风格路径（如 `C:\...`）默认不会自动采用
-3. `--execute` 已下线，不再支持
-4. 非交互终端只生成步骤，不会执行
-5. 当模型返回空内容或失败时，会自动尝试其他已配置模型兜底
-6. 执行过程中按 `Ctrl+C` 会优雅取消（退出码 130），不会输出 Python traceback
+附加约束：
 
-示例：
+1. Alpine 场景默认优先 Unix 路径。
+2. Windows 风格路径（如 `C:\...`）不会被优先自动采用。
+3. `--execute` 已下线，不再支持。
 
-```bash
-python ai.py shell run "先找 Sam.c 的路径"
-python ai.py shell run "帮我备份这个文件"
-```
+## 7. 数据与状态文件（全部在 root 内）
 
-第二条命令会优先解析“这个文件”为上一轮命中的文件实体，再生成备份命令。
+运行时文件固定在 `root` 下：
 
-旧版流程（仅供理解差异）：
+1. `assistant-config/profiles.json`：模型配置
+2. `assistant-state/history.json`：历史（`messages/events/planner_traces/resolution_traces/entities`）
+3. `assistant-state/context.json`：代码上下文
+4. `assistant-data/backup_index.json`：备份索引
+5. `assistant-data/backups/`：备份文件
 
-1. 先用模型将自然语言解析为结构化任务，并生成首批步骤草案
-2. 询问是否开始执行（`y/n`）
-3. 每一步执行前再次确认（`y/n`）
-4. 每一步执行后立即输出结果并写入历史
-5. 下一步会基于上一步 `stdout/stderr/exit code` 重新规划，不是机械照抄草案
+## 8. 开发与测试
 
-## 4. 让 `ai` 命令可直接使用（可选）
-
-默认用 `python ai.py ...` 即可。  
-如果你希望直接输入 `ai ...`：
+基础测试：
 
 ```bash
 cd root
-chmod +x ai.py
-ln -sf "$(pwd)/ai.py" /usr/local/bin/ai
-ai -h
+python -m pytest -q
 ```
 
-## 5. 数据目录说明
-
-运行时数据都在 `root` 目录内：
-
-1. 配置目录：`root/assistant-config`
-2. 状态目录：`root/assistant-state`
-3. 数据目录：`root/assistant-data`
-
-主要文件：
-
-1. `assistant-config/profiles.json`：模型配置
-2. `assistant-state/history.json`：输入输出历史（含 messages/events/planner_traces/entities）
-3. `assistant-state/context.json`：代码上下文
-4. `assistant-data/backup_index.json`：备份索引
-
-## 6. 常见问题
-
-### Q1: `ai config -h` 运行失败
-
-如果你还没创建 `ai` 命令，请改用：
+覆盖率门禁：
 
 ```bash
-python ai.py config -h
+python -m pytest \
+  --cov=ai_assistant \
+  --cov-report=term-missing \
+  --cov-report=annotate:cov_annotate \
+  --cov-fail-under=90
 ```
 
-### Q2: `ai: command not found`
+当前仓库状态（2026-03-04）：
 
-说明系统里还没有 `ai` 可执行入口，按上面的“让 `ai` 命令可直接使用”步骤创建软链接。
+1. `151 passed`
+2. 总覆盖率 `94.16%`
 
-### Q3: 提示“当前配置缺少 API Key”
+## 9. 常见问题
 
-执行：
+### Q1: `ai config switch` 不带参数会失败吗？
 
-```bash
-python ai.py config current
-python config.py --add
-python ai.py config switch <你的profile>
-```
+不会。TTY 下会进入交互选择；非交互环境会提示你显式传 `profile`。
 
-### Q4: 删除命令没有执行
+### Q2: 为什么会看到明文 API Key 警告？
 
-`file rm` 和 `file rmdir` 会要求二次确认输入 `y`，未确认时会返回“已取消”。
+表示你把 key 写在配置文件里。建议使用环境变量并避免提交配置到仓库。
 
-## 7. 安全建议
+### Q3: 为什么 `shell run` 先问确认？
 
-1. 不要把真实 API Key 提交到 Git。
-2. 使用 `.gitignore` 排除本地运行目录与敏感文件。
-3. `config export` 建议使用 `--redact` 生成脱敏文件。
+这是默认安全策略，避免自然语言误触发有副作用命令。
+
+### Q4: 为什么有时提示“请补充目标文件名”？
+
+因为当前描述缺少必要参数（例如只说“帮我修改”但没给文件）。
+
+## 10. 安全建议
+
+1. 不要提交真实 API Key。
+2. 导出配置时优先使用 `--redact`。
+3. 删除命令和写入命令都应先在测试文件验证。
