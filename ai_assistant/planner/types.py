@@ -38,6 +38,15 @@ class TaskSpec:
 
 
 @dataclass
+class WorkflowState:
+    target_file: str = ""
+    resolution_status: str = "unresolved"
+    candidates: list[str] = field(default_factory=list)
+    resolved_file: str = ""
+    last_step: str = ""
+
+
+@dataclass
 class PlanStep:
     command: str
     purpose: str = ""

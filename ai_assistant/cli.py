@@ -20,6 +20,7 @@ from ai_assistant.services.context_service import ContextService
 from ai_assistant.services.file_service import FileService
 from ai_assistant.services.history_service import HistoryService
 from ai_assistant.services.shell_service import ShellService
+from ai_assistant.ui import RuntimeFeedback
 
 
 class ArgumentParsingExit(Exception):
@@ -198,7 +199,7 @@ def _build_parser() -> RecordingArgumentParser:
     config_add.add_argument("--model", required=True)
     config_add.add_argument("--stream", type=_parse_on_off, default=False)
     config_switch = config_sub.add_parser("switch")
-    config_switch.add_argument("profile")
+    config_switch.add_argument("profile", nargs="?")
     config_sub.add_parser("list")
     config_sub.add_parser("current")
     config_delete = config_sub.add_parser("delete")
@@ -297,6 +298,7 @@ def _handle_context(args: argparse.Namespace, ctx: AppContext) -> CommandResult:
             stream_override=None,
             print_stream=True,
             timeout=90,
+            attempt_callback=RuntimeFeedback(enabled=True).as_attempt_callback(),
         )
         stream_enabled = ctx.config_service.get_active_profile().stream
         if response.ok:
@@ -354,8 +356,50 @@ def _handle_config(args: argparse.Namespace, ctx: AppContext) -> CommandResult:
         )
         return CommandResult(ok, message, 0 if ok else 1)
     if args.action == "switch":
-        ok, message = service.switch_profile(args.profile)
-        return CommandResult(ok, message, 0 if ok else 1)
+        if args.profile:
+            ok, message = service.switch_profile(args.profile)
+            return CommandResult(ok, message, 0 if ok else 1)
+
+        profiles = service.list_profiles()
+        if not profiles:
+            return CommandResult(False, "❌ 无可用配置", 1)
+
+        stdin_is_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
+        stdout_is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        if not (stdin_is_tty and stdout_is_tty):
+            lines = ["❌ 请指定 profile。可用配置："]
+            for profile in profiles:
+                lines.append(f"  - {profile['id']}")
+            lines.append("示例：ai config switch <profile>")
+            return CommandResult(False, "\n".join(lines), 2)
+
+        print("📋 可用配置：")
+        for index, profile in enumerate(profiles, 1):
+            current_mark = "⭐" if profile["current"] else "  "
+            print(f"  {index}. {current_mark} {profile['id']} ({profile['name']})")
+
+        while True:
+            try:
+                choice = input("请输入序号或配置 ID（q 取消）: ").strip()
+            except EOFError:
+                return CommandResult(True, "✅ 已取消切换", 0)
+            if not choice:
+                print("请输入有效序号或配置 ID")
+                continue
+            lowered = choice.lower()
+            if lowered in {"q", "quit", "exit"}:
+                return CommandResult(True, "✅ 已取消切换", 0)
+
+            target = choice
+            if choice.isdigit():
+                index = int(choice) - 1
+                if index < 0 or index >= len(profiles):
+                    print("序号无效，请重新输入")
+                    continue
+                target = profiles[index]["id"]
+
+            ok, message = service.switch_profile(target)
+            return CommandResult(ok, message, 0 if ok else 1)
     if args.action == "list":
         profiles = service.list_profiles()
         lines = ["📋 配置列表："]
@@ -476,6 +520,13 @@ def run(argv: list[str] | None = None) -> int:
 
     try:
         result = _dispatch(argv, ctx)
+    except KeyboardInterrupt:
+        result = CommandResult(
+            False,
+            "❌ 操作已取消",
+            130,
+            data={"interrupted": True, "module_hint": (argv[0] if argv else "none")},
+        )
     except Exception as exc:
         traceback_text = traceback.format_exc()
         result = CommandResult(False, f"❌ 内部错误：{exc}", 1, data={"traceback": traceback_text})
@@ -494,7 +545,10 @@ def run(argv: list[str] | None = None) -> int:
             output_text=history_output,
             ok=result.ok,
             exit_code=result.exit_code,
-            metadata={"module": (result.data or {}).get("module_hint") or (argv[0] if argv else "none")},
+            metadata={
+                "module": (result.data or {}).get("module_hint") or (argv[0] if argv else "none"),
+                "interrupted": bool((result.data or {}).get("interrupted", False)),
+            },
         )
     except Exception:
         pass

@@ -28,6 +28,15 @@ class AIGateway:
                 ordered.append(profile_id)
         return ordered
 
+    @staticmethod
+    def _emit_attempt_event(callback: callable | None, payload: dict[str, Any]) -> None:
+        if callback is None:
+            return
+        try:
+            callback(payload)
+        except Exception:
+            return
+
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -37,63 +46,111 @@ class AIGateway:
         max_tokens: int | None = None,
         timeout: int = 60,
         print_stream: bool = False,
+        attempt_callback: callable | None = None,
         allow_fallback: bool = True,
         fallback_profiles: list[str] | None = None,
     ) -> AIResponseEnvelope:
         attempts: list[dict[str, Any]] = []
         attempt_order = self._profile_attempt_order(allow_fallback=allow_fallback, fallback_profiles=fallback_profiles)
 
+        self._emit_attempt_event(
+            attempt_callback,
+            {"event": "chat_start", "attempt_order": attempt_order, "print_stream": bool(print_stream)},
+        )
         last_error_text = "❌ API 返回空内容"
         last_error_code = "empty_content"
-        for profile_id in attempt_order:
-            request_kwargs: dict[str, Any] = {
-                "stream_override": stream_override,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "timeout": timeout,
-                "print_stream": print_stream,
-            }
-            if profile_id:
-                request_kwargs["profile_override"] = profile_id
-
-            ok, content = self.ai_client.chat(messages, **request_kwargs)
-            text = (content or "").strip()
-            attempt: dict[str, Any] = {
-                "profile_id": profile_id,
-                "ok": bool(ok and text),
-                "error_code": "",
-                "content_preview": text[:240],
-            }
-
-            if not ok:
-                attempt["error_code"] = "request_failed"
-                attempts.append(attempt)
-                last_error_text = content
-                last_error_code = "request_failed"
-                continue
-            if not text:
-                attempt["error_code"] = "empty_content"
-                attempts.append(attempt)
-                last_error_text = "❌ API 返回空内容"
-                last_error_code = "empty_content"
-                continue
-
-            attempts.append(attempt)
-            return AIResponseEnvelope(
-                ok=True,
-                content=content,
-                error_code="",
-                attempts=attempts,
-                used_profile=profile_id,
-            )
-
-        return AIResponseEnvelope(
+        response_envelope = AIResponseEnvelope(
             ok=False,
             content=last_error_text,
             error_code=last_error_code,
             attempts=attempts,
             used_profile="",
         )
+
+        try:
+            for index, profile_id in enumerate(attempt_order):
+                request_kwargs: dict[str, Any] = {
+                    "stream_override": stream_override,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "timeout": timeout,
+                    "print_stream": print_stream,
+                }
+                if profile_id:
+                    request_kwargs["profile_override"] = profile_id
+
+                ok, content = self.ai_client.chat(messages, **request_kwargs)
+                text = (content or "").strip()
+                attempt: dict[str, Any] = {
+                    "profile_id": profile_id,
+                    "ok": bool(ok and text),
+                    "error_code": "",
+                    "content_preview": text[:240],
+                }
+
+                if not ok:
+                    attempt["error_code"] = "request_failed"
+                    attempts.append(attempt)
+                    last_error_text = content
+                    last_error_code = "request_failed"
+                    next_profile = attempt_order[index + 1] if index + 1 < len(attempt_order) else ""
+                    if next_profile and next_profile != profile_id:
+                        self._emit_attempt_event(
+                            attempt_callback,
+                            {
+                                "event": "fallback_switch",
+                                "from_profile": profile_id,
+                                "to_profile": next_profile,
+                                "reason": "request_failed",
+                            },
+                        )
+                    continue
+                if not text:
+                    attempt["error_code"] = "empty_content"
+                    attempts.append(attempt)
+                    last_error_text = "❌ API 返回空内容"
+                    last_error_code = "empty_content"
+                    next_profile = attempt_order[index + 1] if index + 1 < len(attempt_order) else ""
+                    if next_profile and next_profile != profile_id:
+                        self._emit_attempt_event(
+                            attempt_callback,
+                            {
+                                "event": "fallback_switch",
+                                "from_profile": profile_id,
+                                "to_profile": next_profile,
+                                "reason": "empty_content",
+                            },
+                        )
+                    continue
+
+                attempts.append(attempt)
+                response_envelope = AIResponseEnvelope(
+                    ok=True,
+                    content=content,
+                    error_code="",
+                    attempts=attempts,
+                    used_profile=profile_id,
+                )
+                return response_envelope
+
+            response_envelope = AIResponseEnvelope(
+                ok=False,
+                content=last_error_text,
+                error_code=last_error_code,
+                attempts=attempts,
+                used_profile="",
+            )
+            return response_envelope
+        finally:
+            self._emit_attempt_event(
+                attempt_callback,
+                {
+                    "event": "chat_end",
+                    "ok": response_envelope.ok,
+                    "used_profile": response_envelope.used_profile,
+                    "error_code": response_envelope.error_code,
+                },
+            )
 
     def summarize_messages(self, messages: list[dict[str, str]]) -> str:
         prompt = [
@@ -109,6 +166,7 @@ class AIGateway:
             max_tokens=512,
             timeout=60,
             print_stream=False,
+            attempt_callback=None,
             allow_fallback=True,
         )
         if not response.ok:

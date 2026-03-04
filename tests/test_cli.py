@@ -114,6 +114,36 @@ class CLITests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("usage: ai config", result.stdout)
 
+    def test_config_switch_without_profile_in_non_tty_returns_guidance(self) -> None:
+        result = self.run_cli("config", "switch")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("请指定 profile", result.stdout)
+        self.assertIn("ai config switch <profile>", result.stdout)
+
+    def test_config_switch_without_profile_supports_interactive_select(self) -> None:
+        if str(ROOT_DIR) not in sys.path:
+            sys.path.insert(0, str(ROOT_DIR))
+
+        import ai_assistant.cli as cli_module  # pylint: disable=import-outside-toplevel
+
+        ctx = cli_module.AppContext()
+        ctx.config_service.add_profile(
+            profile_id="demo",
+            name="Demo",
+            api_key="sk-demo",
+            api_url="https://example.com/v1/chat/completions",
+            model="demo-model",
+            stream=False,
+            overwrite=False,
+        )
+        args = cli_module.argparse.Namespace(action="switch", profile=None)
+        with mock.patch("sys.stdin.isatty", return_value=True):
+            with mock.patch("sys.stdout.isatty", return_value=True):
+                with mock.patch("builtins.input", side_effect=["2"]):
+                    result = cli_module._handle_config(args, ctx)
+        self.assertTrue(result.ok)
+        self.assertIn("已切换到配置", result.message)
+
     def test_execute_flag_is_removed(self) -> None:
         result = self.run_cli("--execute")
         self.assertEqual(result.returncode, 2)
@@ -164,6 +194,22 @@ class CLITests(unittest.TestCase):
         result = self.run_cli("重试")
         self.assertEqual(result.returncode, 1)
         self.assertIn("未找到可重试任务", result.stdout)
+
+    def test_keyboard_interrupt_returns_130_without_traceback(self) -> None:
+        if str(ROOT_DIR) not in sys.path:
+            sys.path.insert(0, str(ROOT_DIR))
+
+        import ai_assistant.cli as cli_module  # pylint: disable=import-outside-toplevel
+
+        with mock.patch.object(cli_module, "_dispatch", side_effect=KeyboardInterrupt):
+            with mock.patch.object(sys, "argv", [str(AI_ENTRY), "chat", "hello"]):
+                code = cli_module.run(["chat", "hello"])
+        self.assertEqual(code, 130)
+
+        payload = self.load_history_payload()
+        latest = payload["events"][-1]
+        self.assertEqual(latest.get("exit_code"), 130)
+        self.assertTrue(bool(latest.get("metadata", {}).get("interrupted", False)))
 
 
 if __name__ == "__main__":

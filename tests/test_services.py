@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from ai_assistant.paths import PathManager
 from ai_assistant.services.backup_service import BackupService
 from ai_assistant.services.ai_client import AIClient
+from ai_assistant.services.ai_gateway import AIGateway
 from ai_assistant.services.chat_service import ChatService
 from ai_assistant.services.code_service import CodeService
 from ai_assistant.services.config_service import ConfigService
@@ -362,6 +363,37 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("不是可执行命令", message)
 
+    def test_generate_command_rejects_placeholder_command(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"summary":"测试","steps":[{"command":"<可直接执行命令>","purpose":"错误示例"}]}'
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, message = service.generate_command("打印 hello")
+        self.assertFalse(ok)
+        self.assertIn("未替换占位符", message)
+
+    def test_generate_command_repairs_placeholder_command(self) -> None:
+        fake_client = FakeAIClient(
+            responses=[
+                '{"summary":"测试","steps":[{"command":"<可直接执行命令>","purpose":"错误示例"}]}',
+                '{"summary":"打印","steps":[{"command":"echo hello","purpose":"打印"}]}',
+            ]
+        )
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        ok, command_text = service.generate_command("打印 hello")
+        self.assertTrue(ok)
+        self.assertIn("echo hello", command_text)
+
     def test_generate_command_requires_filename_for_comment_intent(self) -> None:
         fake_client = FakeAIClient(
             responses=[
@@ -377,7 +409,7 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("缺少目标文件名", message)
 
-    def test_generate_command_builds_placeholder_workflow_when_file_missing(self) -> None:
+    def test_generate_command_builds_discovery_first_workflow_when_file_missing(self) -> None:
         fake_client = FakeAIClient(
             responses=[
                 '{"capability_id":"code.comment","parameters":{"file":"test123.c"},"missing_parameters":[],"note":""}'
@@ -391,7 +423,8 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         ok, command_text = service.generate_command("我想为test123.c添加注释")
         self.assertTrue(ok)
         self.assertIn("find . -type f -name", command_text)
-        self.assertIn("ai code comment <FILE_PATH> --start 1 --end <END_LINE> --yes", command_text)
+        self.assertNotIn("<FILE_PATH>", command_text)
+        self.assertNotIn("<END_LINE>", command_text)
 
     def test_generate_command_rejects_incomplete_ai_code_command(self) -> None:
         fake_client = FakeAIClient(response='{"summary":"检查","steps":[{"command":"ai code check test123.c","purpose":"检查"}]}')
@@ -533,6 +566,19 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("非交互模式", message)
 
+    def test_run_stdout_not_tty_is_non_interactive(self) -> None:
+        fake_client = FakeAIClient(response='{"summary":"打印","steps":[{"command":"echo hello","purpose":"打印"}]}')
+        manager = PathManager(project_root=self.project_root)
+        history = HistoryService(manager)
+        context = ContextService(manager)
+        service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
+
+        with mock.patch("sys.stdin.isatty", return_value=True):
+            with mock.patch("sys.stdout.isatty", return_value=False):
+                ok, message = service.run("打印 hello")
+        self.assertTrue(ok)
+        self.assertIn("非交互模式", message)
+
     def test_run_interactive_can_cancel_execution(self) -> None:
         fake_client = FakeAIClient(response='{"summary":"打印","steps":[{"command":"echo hello","purpose":"打印"}]}')
         manager = PathManager(project_root=self.project_root)
@@ -541,8 +587,9 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
 
         with mock.patch("sys.stdin.isatty", return_value=True):
-            with mock.patch.object(ShellService, "_confirm_with_prompt", return_value=(False, "n")):
-                ok, message = service.run("打印 hello")
+            with mock.patch("sys.stdout.isatty", return_value=True):
+                with mock.patch.object(ShellService, "_confirm_with_prompt", return_value=(False, "n")):
+                    ok, message = service.run("打印 hello")
         self.assertTrue(ok)
         self.assertIn("已取消执行", message)
 
@@ -559,21 +606,22 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
 
         with mock.patch("sys.stdin.isatty", return_value=True):
-            with mock.patch.object(
-                ShellService,
-                "_confirm_with_prompt",
-                side_effect=[(True, "y"), (True, "y")],
-            ):
-                with mock.patch(
-                    "subprocess.run",
-                    return_value=subprocess.CompletedProcess(
-                        args="echo hello",
-                        returncode=0,
-                        stdout="hello\n",
-                        stderr="",
-                    ),
+            with mock.patch("sys.stdout.isatty", return_value=True):
+                with mock.patch.object(
+                    ShellService,
+                    "_confirm_with_prompt",
+                    side_effect=[(True, "y"), (True, "y")],
                 ):
-                    ok, message = service.run("打印 hello")
+                    with mock.patch(
+                        "subprocess.run",
+                        return_value=subprocess.CompletedProcess(
+                            args="echo hello",
+                            returncode=0,
+                            stdout="hello\n",
+                            stderr="",
+                        ),
+                    ):
+                        ok, message = service.run("打印 hello")
 
         self.assertTrue(ok)
         self.assertIn("完成", message)
@@ -598,15 +646,16 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
             subprocess.CompletedProcess(args="echo two", returncode=0, stdout="two\n", stderr=""),
         ]
         with mock.patch("sys.stdin.isatty", return_value=True):
-            with mock.patch.object(
-                ShellService,
-                "_confirm_with_prompt",
-                side_effect=[(True, "y"), (True, "y"), (True, "y")],
-            ):
-                with mock.patch("subprocess.run", side_effect=run_outputs):
-                    emitted: list[str] = []
-                    with mock.patch.object(ShellService, "_emit_runtime_output", side_effect=emitted.append):
-                        ok, message = service.run("做两步演示")
+            with mock.patch("sys.stdout.isatty", return_value=True):
+                with mock.patch.object(
+                    ShellService,
+                    "_confirm_with_prompt",
+                    side_effect=[(True, "y"), (True, "y"), (True, "y")],
+                ):
+                    with mock.patch("subprocess.run", side_effect=run_outputs):
+                        emitted: list[str] = []
+                        with mock.patch.object(ShellService, "_emit_runtime_output", side_effect=emitted.append):
+                            ok, message = service.run("做两步演示")
 
         self.assertTrue(ok)
         self.assertIn("完成", message)
@@ -628,21 +677,22 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
 
         with mock.patch("sys.stdin.isatty", return_value=True):
-            with mock.patch.object(
-                ShellService,
-                "_confirm_with_prompt",
-                side_effect=[(True, "y"), (True, "y")],
-            ):
-                with mock.patch(
-                    "subprocess.run",
-                    return_value=subprocess.CompletedProcess(
-                        args="echo hello",
-                        returncode=0,
-                        stdout=b"hello\n",
-                        stderr=b"",
-                    ),
+            with mock.patch("sys.stdout.isatty", return_value=True):
+                with mock.patch.object(
+                    ShellService,
+                    "_confirm_with_prompt",
+                    side_effect=[(True, "y"), (True, "y")],
                 ):
-                    ok, message = service.run("打印 hello")
+                    with mock.patch(
+                        "subprocess.run",
+                        return_value=subprocess.CompletedProcess(
+                            args="echo hello",
+                            returncode=0,
+                            stdout=b"hello\n",
+                            stderr=b"",
+                        ),
+                    ):
+                        ok, message = service.run("打印 hello")
 
         self.assertTrue(ok)
         self.assertIn("完成", message)
@@ -713,14 +763,15 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         ]
 
         with mock.patch("sys.stdin.isatty", return_value=True):
-            with mock.patch.object(
-                ShellService,
-                "_confirm_with_prompt",
-                side_effect=[(True, "y"), (True, "y"), (True, "y")],
-            ):
-                with mock.patch("subprocess.run", side_effect=run_outputs):
-                    with mock.patch.object(ShellService, "_emit_runtime_output"):
-                        ok, message = service.run("执行 demo 工作流")
+            with mock.patch("sys.stdout.isatty", return_value=True):
+                with mock.patch.object(
+                    ShellService,
+                    "_confirm_with_prompt",
+                    side_effect=[(True, "y"), (True, "y"), (True, "y")],
+                ):
+                    with mock.patch("subprocess.run", side_effect=run_outputs):
+                        with mock.patch.object(ShellService, "_emit_runtime_output"):
+                            ok, message = service.run("执行 demo 工作流")
 
         self.assertTrue(ok)
         self.assertIn("完成", message)
@@ -752,17 +803,18 @@ class ShellServiceTests(EnvMixin, unittest.TestCase):
         service = ShellService(ai_client=fake_client, history_service=history, context_service=context)
 
         with mock.patch("sys.stdin.isatty", return_value=True):
-            with mock.patch.object(ShellService, "_confirm_with_prompt", side_effect=[(True, "y"), (True, "y")]):
-                with mock.patch(
-                    "subprocess.run",
-                    return_value=subprocess.CompletedProcess(
-                        args="find . -type f -name Sam.c",
-                        returncode=0,
-                        stdout=f"{target}\n",
-                        stderr="",
-                    ),
-                ):
-                    ok_first, message_first = service.run("帮我找到Sam.c文件的位置")
+            with mock.patch("sys.stdout.isatty", return_value=True):
+                with mock.patch.object(ShellService, "_confirm_with_prompt", side_effect=[(True, "y"), (True, "y")]):
+                    with mock.patch(
+                        "subprocess.run",
+                        return_value=subprocess.CompletedProcess(
+                            args="find . -type f -name Sam.c",
+                            returncode=0,
+                            stdout=f"{target}\n",
+                            stderr="",
+                        ),
+                    ):
+                        ok_first, message_first = service.run("帮我找到Sam.c文件的位置")
         self.assertTrue(ok_first)
         self.assertIn("找到", message_first)
 
@@ -902,6 +954,59 @@ class AIPromptCompositionTests(EnvMixin, unittest.TestCase):
         self.assertIn("可用 CLI 命令规范", merged)
 
 
+class AIGatewayTests(unittest.TestCase):
+    def test_gateway_emits_callback_when_fallback_switch_happens(self) -> None:
+        profile_primary = mock.Mock(profile_id="primary")
+        config_service = mock.Mock()
+        config_service.get_active_profile.return_value = profile_primary
+        config_service.list_profile_ids.return_value = ["primary", "backup"]
+
+        ai_client = mock.Mock()
+        ai_client.config_service = config_service
+        ai_client.chat.side_effect = [
+            (False, "❌ 请求失败"),
+            (True, "ok"),
+        ]
+
+        gateway = AIGateway(ai_client=ai_client)
+        callback_events: list[dict[str, object]] = []
+        response = gateway.chat(
+            [{"role": "user", "content": "hello"}],
+            print_stream=False,
+            allow_fallback=True,
+            attempt_callback=callback_events.append,
+        )
+
+        self.assertTrue(response.ok)
+        self.assertEqual(response.used_profile, "backup")
+        fallback_events = [item for item in callback_events if item.get("event") == "fallback_switch"]
+        self.assertEqual(len(fallback_events), 1)
+        self.assertEqual(fallback_events[0].get("to_profile"), "backup")
+
+    def test_gateway_calls_start_and_end_callback(self) -> None:
+        profile_primary = mock.Mock(profile_id="primary")
+        config_service = mock.Mock()
+        config_service.get_active_profile.return_value = profile_primary
+        config_service.list_profile_ids.return_value = ["primary"]
+
+        ai_client = mock.Mock()
+        ai_client.config_service = config_service
+        ai_client.chat.return_value = (True, "ok")
+
+        gateway = AIGateway(ai_client=ai_client)
+        callback_events: list[dict[str, object]] = []
+        response = gateway.chat(
+            [{"role": "user", "content": "hello"}],
+            print_stream=False,
+            allow_fallback=False,
+            attempt_callback=callback_events.append,
+        )
+
+        self.assertTrue(response.ok)
+        self.assertTrue(any(item.get("event") == "chat_start" for item in callback_events))
+        self.assertTrue(any(item.get("event") == "chat_end" for item in callback_events))
+
+
 class AIClientParsingTests(unittest.TestCase):
     def test_extract_non_stream_content_from_message_parts(self) -> None:
         payload = {
@@ -918,7 +1023,7 @@ class AIClientParsingTests(unittest.TestCase):
         }
         self.assertEqual(AIClient._extract_non_stream_content(payload), "line1\nline2")
 
-    def test_extract_non_stream_content_from_reasoning(self) -> None:
+    def test_extract_non_stream_content_ignores_reasoning(self) -> None:
         payload = {
             "choices": [
                 {
@@ -929,7 +1034,7 @@ class AIClientParsingTests(unittest.TestCase):
                 }
             ]
         }
-        self.assertEqual(AIClient._extract_non_stream_content(payload), "reason-only")
+        self.assertEqual(AIClient._extract_non_stream_content(payload), "")
 
     def test_extract_non_stream_content_from_output_array(self) -> None:
         payload = {
@@ -945,7 +1050,7 @@ class AIClientParsingTests(unittest.TestCase):
         }
         self.assertEqual(AIClient._extract_non_stream_content(payload), "hello world")
 
-    def test_extract_stream_chunk_content_from_reasoning_delta(self) -> None:
+    def test_extract_stream_chunk_content_ignores_reasoning_delta(self) -> None:
         payload = {
             "choices": [
                 {
@@ -957,7 +1062,25 @@ class AIClientParsingTests(unittest.TestCase):
                 }
             ]
         }
-        self.assertEqual(AIClient._extract_stream_chunk_content(payload), "推理片段")
+        self.assertEqual(AIClient._extract_stream_chunk_content(payload), "")
+
+    def test_ensure_thinking_instruction_injected_when_missing(self) -> None:
+        source_messages = [{"role": "user", "content": "hello"}]
+        merged = AIClient._ensure_thinking_instruction(source_messages)
+        self.assertGreaterEqual(len(merged), 2)
+        self.assertEqual(merged[0]["role"], "system")
+        self.assertIn("内部思考", merged[0]["content"])
+        self.assertIn("不要输出思考过程", merged[0]["content"])
+
+    def test_ensure_thinking_instruction_not_duplicated(self) -> None:
+        source_messages = [
+            {"role": "system", "content": AIClient.THINKING_SYSTEM_INSTRUCTION},
+            {"role": "user", "content": "hello"},
+        ]
+        merged = AIClient._ensure_thinking_instruction(source_messages)
+        system_count = sum(1 for item in merged if item.get("role") == "system")
+        self.assertEqual(system_count, 1)
+        self.assertEqual(merged[0]["content"], AIClient.THINKING_SYSTEM_INSTRUCTION)
 
 
 if __name__ == "__main__":

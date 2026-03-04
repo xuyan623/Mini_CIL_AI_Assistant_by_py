@@ -5,6 +5,7 @@ from ai_assistant.services.ai_client import AIClient
 from ai_assistant.services.ai_gateway import AIGateway
 from ai_assistant.services.context_service import ContextService
 from ai_assistant.services.history_service import HistoryService
+from ai_assistant.ui import RuntimeFeedback
 
 
 class ChatService:
@@ -48,6 +49,7 @@ class ChatService:
             history_messages,
             stream_override=None,
             print_stream=True,
+            attempt_callback=RuntimeFeedback(enabled=True).as_attempt_callback(),
         )
         self.history_service.append_exchange(message, response.content)
         return response.content

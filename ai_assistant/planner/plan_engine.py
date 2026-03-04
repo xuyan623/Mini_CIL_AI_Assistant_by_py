@@ -6,7 +6,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from ai_assistant.planner.types import PlanDecision, PlanStep, TaskSpec
+from ai_assistant.planner.types import PlanDecision, PlanStep, TaskSpec, WorkflowState
 
 
 class PlanEngine:
@@ -15,7 +15,29 @@ class PlanEngine:
 
     @staticmethod
     def _contains_placeholder(command: str) -> bool:
-        return bool(re.search(r"<[A-Z0-9_]+>", command))
+        return bool(re.search(r"<[^<>]{1,120}>", command))
+
+    @staticmethod
+    def _normalize_command(command: str) -> str:
+        return " ".join((command or "").strip().split())
+
+    @classmethod
+    def _command_seen(cls, command: str, transcript: list[dict[str, Any]]) -> bool:
+        expected = cls._normalize_command(command)
+        for record in transcript:
+            candidate = cls._normalize_command(str(record.get("command", "")))
+            if candidate == expected:
+                return True
+        return False
+
+    @classmethod
+    def _command_result(cls, command: str, transcript: list[dict[str, Any]]) -> dict[str, Any] | None:
+        expected = cls._normalize_command(command)
+        for record in reversed(transcript):
+            candidate = cls._normalize_command(str(record.get("command", "")))
+            if candidate == expected:
+                return record
+        return None
 
     @staticmethod
     def _extract_find_matches(output_text: str) -> list[str]:
@@ -24,9 +46,16 @@ class PlanEngine:
             line = raw_line.strip()
             if not line:
                 continue
-            if line.startswith(".") or line.startswith("/") or line.startswith("\\"):
+            if line.startswith(".") or line.startswith("/") or line.startswith("\\") or re.match(r"^[A-Za-z]:\\", line):
                 matches.append(line)
-        return matches
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in matches:
+            if item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
 
     @staticmethod
     def _iter_files(search_root: Path) -> list[Path]:
@@ -103,27 +132,37 @@ class PlanEngine:
         return []
 
     @staticmethod
-    def _build_file_resolution_steps(file_name: str, mode: str) -> list[PlanStep]:
+    def _build_discovery_step(file_name: str) -> PlanStep:
         quoted_name = shlex.quote(file_name)
-        steps = [
-            PlanStep(command=f"find . -type f -name {quoted_name}", purpose="定位目标文件"),
-            PlanStep(command="sed -n '1,80p' <FILE_PATH>", purpose="预览文件内容"),
-        ]
-        if mode == "fix":
-            steps.append(PlanStep(command="ai code check <FILE_PATH> --start 1 --end <END_LINE>", purpose="检查问题"))
-            steps.append(
-                PlanStep(
-                    command="ai code optimize <FILE_PATH> --start 1 --end <END_LINE> --yes",
-                    purpose="修复问题",
-                )
-            )
-            steps.append(PlanStep(command="ai code check <FILE_PATH> --start 1 --end <END_LINE>", purpose="复检结果"))
-            return steps
-        command = f"ai code {mode} <FILE_PATH> --start 1 --end <END_LINE>"
-        if mode in {"comment", "optimize"}:
-            command = f"{command} --yes"
-        steps.append(PlanStep(command=command, purpose="执行目标操作"))
-        return steps
+        return PlanStep(command=f"find . -type f -name {quoted_name}", purpose="定位目标文件")
+
+    @staticmethod
+    def _mode_for_task(task: TaskSpec) -> str | None:
+        capability_id = task.capability_id or ""
+        if capability_id == "workflow.code_fix":
+            return "fix"
+        if capability_id == "backup.create":
+            return "backup"
+        if capability_id.startswith("code."):
+            return capability_id.split(".", 1)[1]
+        return None
+
+    def _build_sequence_for_mode(self, mode: str, file_path: str) -> list[PlanStep]:
+        if mode == "backup":
+            quoted = shlex.quote(file_path)
+            return [PlanStep(command=f"ai backup create {quoted} --keep 5", purpose="创建备份")]
+        return self._build_code_steps(file_path, mode)
+
+    @staticmethod
+    def _resolve_existing_file(path_text: str) -> str:
+        candidate = Path(path_text).expanduser()
+        if not candidate.is_absolute():
+            candidate = (Path.cwd() / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+        return ""
 
     def _resolve_single_file(self, target_file: str) -> tuple[str | None, str]:
         matches = self._find_file_matches(target_file)
@@ -155,77 +194,117 @@ class PlanEngine:
             )
             return True, [PlanStep(command=command, purpose="确保目录存在并输出路径")], task.note
 
-        if capability_id == "workflow.code_fix":
-            target_file = task.parameters.get("file", "")
-            resolved_path, note = self._resolve_single_file(target_file)
-            if resolved_path:
-                return True, self._build_code_steps(resolved_path, "fix"), task.note
-            return True, self._build_file_resolution_steps(Path(target_file).name, "fix"), note
+        mode = self._mode_for_task(task)
+        if mode is None:
+            return False, [], ""
 
-        if capability_id == "backup.create":
-            target_file = task.parameters.get("file", "")
-            if not target_file:
-                return False, [], "❌ 描述缺少目标文件名，请补充例如：test123.c"
-            resolved_path, note = self._resolve_single_file(target_file)
-            if resolved_path:
-                quoted = shlex.quote(resolved_path)
-                return True, [PlanStep(command=f"ai backup create {quoted} --keep 5", purpose="创建备份")], task.note
-            return True, [PlanStep(command=f"find . -type f -name {shlex.quote(Path(target_file).name)}", purpose="定位目标文件"), PlanStep(command="ai backup create <FILE_PATH> --keep 5", purpose="创建备份")], note
+        target_file = str(task.parameters.get("file", "")).strip()
+        if not target_file:
+            return False, [], "❌ 描述缺少目标文件名，请补充例如：test123.c"
 
-        if capability_id.startswith("code."):
-            mode = capability_id.split(".", 1)[1]
-            target_file = task.parameters.get("file", "")
-            resolved_path, note = self._resolve_single_file(target_file)
-            if resolved_path:
-                steps = self._build_code_steps(resolved_path, mode)
-                if not steps:
-                    return False, [], f"❌ 暂不支持的代码流程：{mode}"
-                return True, steps, task.note
-            return True, self._build_file_resolution_steps(Path(target_file).name, mode), note
+        resolved_path, note = self._resolve_single_file(target_file)
+        if resolved_path:
+            steps = self._build_sequence_for_mode(mode, resolved_path)
+            if not steps:
+                return False, [], f"❌ 暂不支持的代码流程：{mode}"
+            return True, steps, task.note
 
-        return False, [], ""
+        discovery_step = self._build_discovery_step(Path(target_file).name)
+        return True, [discovery_step], note
+
+    def build_workflow_state(self, task: TaskSpec, transcript: list[dict[str, Any]]) -> WorkflowState:
+        target_file = str(task.parameters.get("file", "")).strip()
+        state = WorkflowState(
+            target_file=target_file,
+            resolution_status="unresolved",
+            candidates=[],
+            resolved_file="",
+            last_step=str(transcript[-1].get("command", "")).strip() if transcript else "",
+        )
+        if not target_file:
+            return state
+
+        existing = self._resolve_existing_file(target_file)
+        if existing:
+            state.resolution_status = "resolved"
+            state.resolved_file = existing
+            return state
+
+        find_records = [
+            item
+            for item in transcript
+            if "find " in str(item.get("command", "")) and "-name" in str(item.get("command", ""))
+        ]
+        if not find_records:
+            return state
+
+        latest_find = find_records[-1]
+        matches = self._extract_find_matches(str(latest_find.get("stdout", "")))
+        if not matches:
+            state.resolution_status = "missing"
+            return state
+        if len(matches) == 1:
+            state.resolution_status = "resolved"
+            state.resolved_file = matches[0]
+            state.candidates = matches
+            return state
+
+        state.resolution_status = "ambiguous"
+        state.candidates = matches
+        return state
+
+    def derive_workflow_decision(self, task: TaskSpec, transcript: list[dict[str, Any]]) -> PlanDecision | None:
+        mode = self._mode_for_task(task)
+        if mode is None:
+            return None
+
+        state = self.build_workflow_state(task, transcript)
+        if not state.target_file:
+            return PlanDecision(action="need_input", message="缺少目标文件，请补充完整路径")
+
+        if state.resolution_status == "unresolved":
+            return PlanDecision(action="next", command=self._build_discovery_step(Path(state.target_file).name).command)
+        if state.resolution_status == "missing":
+            return PlanDecision(
+                action="need_input",
+                message=f"没有找到目标文件：{Path(state.target_file).name}，请补充路径或确认搜索目录",
+            )
+        if state.resolution_status == "ambiguous":
+            listing = "\n".join(f"- {item}" for item in state.candidates[:10])
+            return PlanDecision(action="need_input", message=f"找到多个候选文件，请先明确目标路径：\n{listing}")
+
+        resolved_file = state.resolved_file
+        if not resolved_file:
+            return PlanDecision(action="need_input", message="未能解析目标文件路径，请补充明确路径")
+        task.parameters["file"] = resolved_file
+
+        sequence = self._build_sequence_for_mode(mode, resolved_file)
+        if not sequence:
+            return PlanDecision(action="abort", message=f"暂不支持的流程：{mode}")
+
+        if transcript:
+            last_record = transcript[-1]
+            last_command = str(last_record.get("command", "")).strip()
+            last_exit = int(last_record.get("exit_code", 0))
+            last_stderr = str(last_record.get("stderr", "")).strip()
+            if last_exit != 0 and last_command:
+                for step in sequence:
+                    if self._normalize_command(step.command) == self._normalize_command(last_command):
+                        if step.command.startswith("test -f "):
+                            return PlanDecision(action="need_input", message=f"目标文件不存在：{resolved_file}")
+                        return PlanDecision(action="abort", message=last_stderr or "上一步执行失败，流程已停止")
+
+        for step in sequence:
+            if not self._command_seen(step.command, transcript):
+                return PlanDecision(action="next", command=step.command)
+        return PlanDecision(action="done", message="执行完成")
 
     def resolve_placeholders(self, command: str, transcript: list[dict[str, Any]], task: TaskSpec) -> tuple[bool, str, str]:
-        if not self._contains_placeholder(command):
-            return True, command, ""
-
-        resolved = command
-        if "<FILE_NAME>" in resolved:
-            file_name = task.parameters.get("file", "")
-            file_name = Path(file_name).name if file_name else ""
-            if not file_name:
-                return False, "", "需要目标文件名，但当前描述没有提供"
-            resolved = resolved.replace("<FILE_NAME>", shlex.quote(file_name))
-
-        if "<FILE_PATH>" in resolved:
-            find_records = [
-                item
-                for item in transcript
-                if "find " in str(item.get("command", "")) and "-name" in str(item.get("command", ""))
-            ]
-            if not find_records:
-                return False, "", "需要目标文件路径，但还没有可用的定位结果"
-            last_find = find_records[-1]
-            matches = self._extract_find_matches(str(last_find.get("stdout", "")))
-            if not matches:
-                return False, "", "没有找到目标文件，请确认文件名或搜索目录"
-            if len(matches) > 1:
-                listing = "\n".join(f"- {item}" for item in matches)
-                return False, "", f"找到多个候选文件，请先明确目标路径：\n{listing}"
-            file_path = matches[0]
-            resolved = resolved.replace("<FILE_PATH>", shlex.quote(file_path))
-
-        if "<END_LINE>" in resolved:
-            file_path_match = re.search(r"'([^']+\.[A-Za-z0-9_]+)'|(/[^ ]+\.[A-Za-z0-9_]+)", resolved)
-            if not file_path_match:
-                return False, "", "无法推导结束行号，请先提供目标文件"
-            file_path = file_path_match.group(1) or file_path_match.group(2) or ""
-            quoted = shlex.quote(file_path)
-            resolved = resolved.replace("<END_LINE>", self._end_line_expression(quoted))
-
-        if self._contains_placeholder(resolved):
-            return False, "", "命令仍包含未解析占位符，请补充必要信息"
-        return True, resolved, ""
+        _ = transcript
+        _ = task
+        if self._contains_placeholder(command):
+            return False, "", "命令包含未解析占位符，请先补充缺失信息"
+        return True, command, ""
 
     @staticmethod
     def validate_ai_code_command(command: str) -> tuple[bool, str]:
@@ -281,13 +360,17 @@ class PlanEngine:
     def fallback_next_from_suggestions(
         self, suggested_steps: list[str], transcript: list[dict[str, Any]], task: TaskSpec
     ) -> PlanDecision | None:
+        _ = transcript
+        _ = task
         if not suggested_steps:
             return None
-        raw_next = suggested_steps.pop(0)
-        resolved_ok, resolved_command, resolved_error = self.resolve_placeholders(raw_next, transcript, task)
-        if not resolved_ok:
-            return PlanDecision(action="need_input", message=resolved_error)
-        valid, validation_message = self.validate_ai_code_command(resolved_command)
+        raw_next = suggested_steps.pop(0).strip()
+        if not raw_next:
+            return None
+        if self._contains_placeholder(raw_next):
+            return PlanDecision(action="need_input", message="步骤草案包含未解析信息，请先补充必要参数")
+        valid, validation_message = self.validate_ai_code_command(raw_next)
         if not valid:
             return PlanDecision(action="abort", message=validation_message)
-        return PlanDecision(action="next", command=resolved_command, message="")
+        return PlanDecision(action="next", command=raw_next, message="")
+

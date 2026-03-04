@@ -113,6 +113,7 @@ python ai.py backup clean app.py --keep 3
 ```bash
 python ai.py config list
 python ai.py config current
+python ai.py config switch
 python ai.py config switch deepseek
 python ai.py config stream deepseek on
 python ai.py config delete old_profile
@@ -129,12 +130,13 @@ python ai.py shell run "查找大于 100M 的文件"
 运行流程：
 
 1. 先执行“指代解析”（如“这个文件/它”），若唯一命中则自动回填路径
-2. 再用模型生成首批结构化步骤（必须是 JSON 协议）
-3. 若模型输出非 JSON，会自动进行一次修复回合；修复失败则直接中止
-4. 询问是否开始执行（`y/n`）
-5. 每一步执行前再次确认（`y/n`）
-6. 每一步执行后立即输出结果并写入历史
-7. 下一步会基于上一步 `stdout/stderr/exit code` 重新规划，不是机械照抄草案
+2. 信息不足时先生成可执行的发现步骤（如 `find`），不会展示占位符命令
+3. 再用模型生成首批结构化步骤（必须是 JSON 协议）
+4. 若模型输出非 JSON，会自动进行一次修复回合；修复失败则直接中止
+5. 询问是否开始执行（`y/n`）
+6. 每一步执行前再次确认（`y/n`）
+7. 每一步执行后立即输出结果并写入历史
+8. 下一步会基于上一步 `stdout/stderr/exit code` 重新规划，不是机械照抄草案
 
 说明：
 
@@ -143,6 +145,7 @@ python ai.py shell run "查找大于 100M 的文件"
 3. `--execute` 已下线，不再支持
 4. 非交互终端只生成步骤，不会执行
 5. 当模型返回空内容或失败时，会自动尝试其他已配置模型兜底
+6. 执行过程中按 `Ctrl+C` 会优雅取消（退出码 130），不会输出 Python traceback
 
 示例：
 

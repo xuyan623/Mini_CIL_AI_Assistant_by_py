@@ -155,8 +155,15 @@ class TaskInterpreter:
                 normalized_parameters[key] = str(value).strip()
 
         file_candidate = self._extract_file_candidate(normalized_description)
-        if file_candidate and not normalized_parameters.get("file"):
-            normalized_parameters["file"] = file_candidate
+        ai_file_parameter = str(normalized_parameters.get("file", "")).strip()
+        if file_candidate:
+            if not ai_file_parameter:
+                normalized_parameters["file"] = file_candidate
+            else:
+                ai_file_is_basename = ai_file_parameter == Path(ai_file_parameter).name
+                candidate_is_path = any(separator in file_candidate for separator in ("/", "\\"))
+                if ai_file_is_basename and candidate_is_path:
+                    normalized_parameters["file"] = file_candidate
 
         missing_parameters = parsed.get("missing_parameters", [])
         if not isinstance(missing_parameters, list):

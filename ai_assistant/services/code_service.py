@@ -8,6 +8,7 @@ from ai_assistant.services.ai_gateway import AIGateway
 from ai_assistant.services.backup_service import BackupService
 from ai_assistant.services.context_service import ContextService
 from ai_assistant.services.history_service import HistoryService
+from ai_assistant.ui import RuntimeFeedback
 
 
 class CodeService:
@@ -82,6 +83,7 @@ class CodeService:
             max_tokens=4096,
             timeout=90,
             print_stream=False,
+            attempt_callback=RuntimeFeedback(enabled=True).as_attempt_callback(),
         )
         if not response.ok and response.error_code == "empty_content":
             return True, ""

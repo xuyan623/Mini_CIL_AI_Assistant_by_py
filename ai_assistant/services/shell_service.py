@@ -18,6 +18,7 @@ from ai_assistant.services.ai_gateway import AIGateway
 from ai_assistant.services.context_service import ContextService
 from ai_assistant.services.history_service import HistoryService
 from ai_assistant.services.reference_resolver import ReferenceResolver
+from ai_assistant.ui import RuntimeFeedback
 
 
 @dataclass
@@ -196,10 +197,43 @@ class ShellService:
                 return True
         return False
 
+    @staticmethod
+    def _contains_placeholder_token(command: str) -> bool:
+        candidate = (command or "").strip()
+        if not candidate:
+            return False
+        direct_placeholders = (
+            "<FILE_PATH>",
+            "<FILE_NAME>",
+            "<END_LINE>",
+            "<可直接执行命令>",
+            "<该步目的>",
+            "<简短目标总结>",
+            "<YOUR_COMMAND>",
+            "<COMMAND_HERE>",
+        )
+        if any(token in candidate for token in direct_placeholders):
+            return True
+        if re.fullmatch(r"<[^<>]{1,80}>", candidate):
+            return True
+        for match in re.finditer(r"<([^<>]{1,80})>", candidate):
+            inner = match.group(1).strip()
+            if not inner:
+                continue
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", inner):
+                return True
+            if re.search(r"[\u4e00-\u9fff]", inner):
+                return True
+            if " " in inner:
+                return True
+        return False
+
     def _validate_shell_command(self, command: str) -> tuple[bool, str]:
         candidate = (command or "").strip()
         if not candidate:
             return False, "❌ 生成的命令为空，已中止执行"
+        if self._contains_placeholder_token(candidate):
+            return False, f"❌ 生成命令包含未替换占位符：{candidate[:120]}"
         if self._is_natural_language_line(candidate):
             return False, f"❌ 生成内容不是可执行命令：{candidate[:120]}"
         return True, ""
@@ -240,7 +274,7 @@ class ShellService:
             try:
                 answer = input(prompt).strip().lower()
             except EOFError:
-                return False, ""
+                return False, "__eof__"
             if answer in {"y", "n"}:
                 return answer == "y", answer
             if self._active_trace_context:
@@ -266,14 +300,40 @@ class ShellService:
     def _emit_runtime_output(text: str) -> None:
         print(text, flush=True)
 
+    def _record_interrupt(
+        self,
+        *,
+        trace_id: str,
+        stage: str,
+        reason: str,
+        step: int | None = None,
+        command: str = "",
+    ) -> None:
+        self._record_event(
+            event_type="interrupt",
+            input_text=command or stage,
+            output_text=f"用户中断：{reason}",
+            ok=False,
+            exit_code=130,
+            metadata={
+                "module": "shell",
+                "phase": "control",
+                "trace_id": trace_id,
+                "stage": stage,
+                "reason": reason,
+                "step": step if step is not None else 0,
+                "command": command,
+            },
+        )
+
     def _build_initial_prompt(self, description: str) -> str:
         return (
             "你是 Alpine Linux (/bin/sh + BusyBox) 终端命令规划助手。"
             "请根据用户目标生成首批可执行命令步骤。\n"
             "必须返回严格 JSON：\n"
-            '{"summary":"<简短目标总结>","steps":[{"command":"<可直接执行命令>","purpose":"<该步目的>"}]}\n'
+            '{"summary":"检查 Sam.c 是否有 bug","steps":[{"command":"test -f /home/mycode/Sam.c","purpose":"确认文件存在"},{"command":"ai code check /home/mycode/Sam.c --start 1 --end \\"$(wc -l < /home/mycode/Sam.c)\\"","purpose":"执行检查"}]}\n'
             "约束：\n"
-            "1. command 必须能直接执行，不能使用 <FILE_PATH> 之类占位符。\n"
+            "1. command 必须能直接执行，禁止输出任何 <...> 占位符。\n"
             "2. 若信息不足，先给发现信息的命令（find/sed/head/wc/test）。\n"
             "3. 步骤需可验证、可迭代，不超过 6 步。\n"
             "4. 只返回 JSON，不要解释，不要 Markdown。\n"
@@ -553,6 +613,7 @@ class ShellService:
             max_tokens=max_tokens,
             timeout=timeout,
             print_stream=False,
+            attempt_callback=RuntimeFeedback(enabled=True).as_attempt_callback(),
             allow_fallback=True,
         )
         self._record_planner_trace(
@@ -576,6 +637,7 @@ class ShellService:
                 "error_code": response.error_code,
                 "used_profile": response.used_profile,
                 "attempt_count": len(response.attempts),
+                "attempts": response.attempts,
             },
         )
         return response
@@ -643,6 +705,7 @@ class ShellService:
             return False, task, [], response.content
 
         commands = self._parse_initial_steps(response.content)
+        repair_attempted = False
         if not commands:
             repaired = self._repair_planner_output(
                 trace_id=trace_id,
@@ -651,18 +714,39 @@ class ShellService:
                 raw_content=response.content,
                 expect="initial",
             )
+            repair_attempted = True
             if repaired.ok:
                 commands = self._parse_initial_steps(repaired.content)
         if not commands:
             return False, task, [], "❌ 规划输出不合规：未返回 JSON steps"
 
-        for command in commands:
-            executable, executable_message = self._validate_shell_command(command)
-            if not executable:
-                return False, task, [], executable_message
-            valid, validation_message = self.plan_engine.validate_ai_code_command(command)
-            if not valid:
-                return False, task, [], validation_message
+        def validate_commands(command_list: list[str]) -> tuple[bool, str]:
+            for command in command_list:
+                executable, executable_message = self._validate_shell_command(command)
+                if not executable:
+                    return False, executable_message
+                valid, validation_message = self.plan_engine.validate_ai_code_command(command)
+                if not valid:
+                    return False, validation_message
+            return True, ""
+
+        valid_commands, validation_error = validate_commands(commands)
+        if not valid_commands and not repair_attempted:
+            repaired = self._repair_planner_output(
+                trace_id=trace_id,
+                stage="initial",
+                task_description=task.normalized_description,
+                raw_content=response.content,
+                expect="initial",
+            )
+            repair_attempted = True
+            if repaired.ok:
+                repaired_commands = self._parse_initial_steps(repaired.content)
+                if repaired_commands:
+                    commands = repaired_commands
+                    valid_commands, validation_error = validate_commands(commands)
+        if not valid_commands:
+            return False, task, [], validation_error
         return True, task, commands, task.note
 
     def generate_initial_steps(self, description: str) -> tuple[bool, list[str], str]:
@@ -869,10 +953,13 @@ class ShellService:
             },
         )
 
-        if not sys.stdin.isatty():
+        stdin_is_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
+        stdout_is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        if not (stdin_is_tty and stdout_is_tty):
             return True, f"{plan_text}\nℹ️ 当前终端非交互模式，仅生成步骤草案，未执行"
 
         self._active_trace_context = None
+        current_command = ""
         try:
             self._emit_runtime_output(plan_text)
             start_prompt = "是否开始分步骤尝试执行？(y/n): "
@@ -887,6 +974,8 @@ class ShellService:
                 metadata={"module": "shell", "phase": "control", "trace_id": trace_id, "stage": "start"},
             )
             if not start_ok:
+                if start_answer == "__eof__":
+                    self._record_interrupt(trace_id=trace_id, stage="start", reason="eof", step=None)
                 return True, "✅ 已取消执行"
 
             transcript: list[dict[str, Any]] = []
@@ -941,6 +1030,14 @@ class ShellService:
                     },
                 )
                 if not confirmed:
+                    if confirm_answer == "__eof__":
+                        self._record_interrupt(
+                            trace_id=trace_id,
+                            stage="step_confirm",
+                            reason="eof",
+                            step=step_index,
+                            command=resolved_command,
+                        )
                     return True, f"✅ 第 {step_index} 步已取消，流程停止"
 
                 step_result = self.step_executor.execute(resolved_command)
@@ -991,21 +1088,27 @@ class ShellService:
                     }
                 )
 
-                ai_ok, ai_decision = self._plan_next_with_ai(task.normalized_description, transcript, suggested_steps, trace_id)
-                if ai_ok:
-                    decision = ai_decision
+                retry_decision = self.plan_engine.derive_retry_decision(transcript)
+                if retry_decision is not None:
+                    decision = retry_decision
                 else:
-                    retry_decision = self.plan_engine.derive_retry_decision(transcript)
-                    if retry_decision is not None:
-                        decision = retry_decision
+                    workflow_decision = self.plan_engine.derive_workflow_decision(task, transcript)
+                    if workflow_decision is not None:
+                        decision = workflow_decision
                     else:
-                        fallback = self.plan_engine.fallback_next_from_suggestions(suggested_steps, transcript, task)
-                        if fallback is not None:
-                            decision = fallback
-                        elif step_result.ok:
-                            return True, "✅ 执行完成"
+                        ai_ok, ai_decision = self._plan_next_with_ai(
+                            task.normalized_description, transcript, suggested_steps, trace_id
+                        )
+                        if ai_ok:
+                            decision = ai_decision
                         else:
-                            return False, f"❌ 上一步失败且无法生成下一步：{ai_decision.message}"
+                            fallback = self.plan_engine.fallback_next_from_suggestions(suggested_steps, transcript, task)
+                            if fallback is not None:
+                                decision = fallback
+                            elif step_result.ok:
+                                return True, "✅ 执行完成"
+                            else:
+                                return False, f"❌ 上一步失败且无法生成下一步：{ai_decision.message}"
 
                 if decision.action == "done":
                     done_message = decision.message or "执行完成"
@@ -1037,5 +1140,14 @@ class ShellService:
                 current_command = next_command
 
             return False, f"❌ 已达到最大步骤数（{self.max_steps}），流程停止"
+        except KeyboardInterrupt:
+            self._record_interrupt(
+                trace_id=trace_id,
+                stage="runtime",
+                reason="ctrl_c",
+                step=self._active_trace_context.get("step") if self._active_trace_context else None,
+                command=current_command,
+            )
+            raise
         finally:
             self._active_trace_context = None

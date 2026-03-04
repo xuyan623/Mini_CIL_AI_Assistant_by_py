@@ -10,6 +10,11 @@ from ai_assistant.services.config_service import ConfigService
 
 
 class AIClient:
+    THINKING_SYSTEM_INSTRUCTION = (
+        "内部要求：请先进行充分的内部思考再回答。"
+        "不要输出思考过程或推理链，只输出最终可读答案。"
+    )
+
     def __init__(self, config_service: ConfigService | None = None) -> None:
         self.config_service = config_service or ConfigService()
 
@@ -38,7 +43,7 @@ class AIClient:
                     chunks.append(fragment)
             return "".join(chunks)
         if isinstance(value, dict):
-            for key in ("text", "content", "value", "reasoning_content", "output_text", "output"):
+            for key in ("text", "content", "value", "output_text", "output"):
                 fragment = AIClient._extract_text_fragment(value.get(key))
                 if fragment:
                     return fragment
@@ -54,11 +59,8 @@ class AIClient:
 
             if isinstance(message, dict):
                 content = AIClient._extract_text_fragment(message.get("content"))
-                reasoning = AIClient._extract_text_fragment(message.get("reasoning_content"))
                 if content:
                     return content
-                if reasoning:
-                    return reasoning
 
             text_choice = AIClient._extract_text_fragment(first_choice.get("text"))
             if text_choice:
@@ -80,7 +82,7 @@ class AIClient:
                 extracted_delta = AIClient._extract_text_fragment(delta_payload)
                 if extracted_delta:
                     return extracted_delta
-                for key in ("content", "text", "reasoning_content", "output_text"):
+                for key in ("content", "text", "output_text"):
                     extracted = AIClient._extract_text_fragment(first_choice.get(key))
                     if extracted:
                         return extracted
@@ -90,6 +92,26 @@ class AIClient:
             if extracted:
                 return extracted
         return ""
+
+    @classmethod
+    def _ensure_thinking_instruction(cls, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip()
+            content = str(item.get("content", ""))
+            if role and content:
+                normalized.append({"role": role, "content": content})
+
+        for message in normalized:
+            if message.get("role") != "system":
+                continue
+            content = message.get("content", "")
+            if "内部思考" in content and "不要输出思考过程" in content:
+                return normalized
+
+        return [{"role": "system", "content": cls.THINKING_SYSTEM_INSTRUCTION}, *normalized]
 
     def chat(
         self,
@@ -112,9 +134,11 @@ class AIClient:
         if not profile.api_key:
             return False, "❌ 当前配置缺少 API Key，请先执行 config add 或切换配置"
 
+        request_messages = self._ensure_thinking_instruction(messages)
+
         request_payload: dict[str, Any] = {
             "model": profile.model,
-            "messages": messages,
+            "messages": request_messages,
             "temperature": temperature,
             "stream": bool(stream),
         }
