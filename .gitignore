@@ -26,4 +26,7 @@ assistant-data/
 .coverage
 .coverage.*
 cov_annotate/
+.pytest_cache*
 .tmp_profile.prof
+.tmp_*.prof
+.tmp_*.txt

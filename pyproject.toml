@@ -1,4 +1,7 @@
 [tool.pytest.ini_options]
-addopts = "-q --cov=ai_assistant --cov-report=term-missing --cov-report=annotate:cov_annotate --cov-fail-under=90"
-testpaths = ["tests"]
+addopts = "-q --cov=ai_assistant --cov-report=term-missing --cov-report=annotate:../codexMake/reports/cov_annotate --cov-fail-under=90"
+testpaths = ["../codexMake/qa/tests"]
+cache_dir = "../codexMake/reports/.pytest_cache"
 
+[tool.coverage.run]
+data_file = "../codexMake/reports/.coverage"

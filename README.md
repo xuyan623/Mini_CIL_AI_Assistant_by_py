@@ -203,7 +203,7 @@ python -m pytest -q
 python -m pytest \
   --cov=ai_assistant \
   --cov-report=term-missing \
-  --cov-report=annotate:cov_annotate \
+  --cov-report=annotate:../codexMake/reports/cov_annotate \
   --cov-fail-under=90
 ```
 
@@ -211,6 +211,13 @@ python -m pytest \
 
 1. `python -m pytest -q` 可通过
 2. 覆盖率门禁 `--cov-fail-under=90` 已启用并可通过
+
+开发辅助目录（仓库根目录 `codexMake/`，与 `root/` 同级）：
+
+1. `../codexMake/qa/tests/`：测试用例（含 `perf/` 与 `golden/`）
+2. `../codexMake/docs/content/`：开发文档（迁移、性能、特性矩阵）
+3. `../codexMake/reports/`：覆盖率与测试缓存产物
+4. `../codexMake/profiling/`：性能剖析与调试产物
 
 ## 9. 常见问题
 
